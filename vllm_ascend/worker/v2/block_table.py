@@ -30,7 +30,7 @@ class AscendBlockTables(BlockTables):
     """Block table for Ascend NPUs."""
 
     # Main vLLM follows #57169: public block tables stay at manager-block
-    # granularity and kernel-block mapping belongs to AttentionGroup. The
+    # granularity and kernel-block mapping belongs to AttentionGroup.
 
     block_sizes_tensor: torch.Tensor
 
