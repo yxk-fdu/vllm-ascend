@@ -1549,9 +1549,8 @@ def allocate_kv_cache_main(
 
     # Upstream does not create AttentionGroup objects for cache specs without
     # layer views (for example Mamba/GDN state). Ascend still needs backend and
-    # spec information to build those physical views, so add only these
-    # non-attention fallback groups; attention groups always use the canonical
-    # objects above and their finalized kernel_block_size.
+    # spec information to build those physical views. Encoder-only caches are
+    # runner-only and must stay out of this allocation/reshape path.
     covered_layers = {
         layer_name
         for group in attn_groups
@@ -1567,6 +1566,8 @@ def allocate_kv_cache_main(
             layer_spec = kv_cache_group.kv_cache_spec
             if isinstance(layer_spec, UniformTypeKVCacheSpecs):
                 layer_spec = layer_spec.kv_cache_specs[layer_name]
+            if isinstance(layer_spec, EncoderOnlyAttentionSpec):
+                continue
             key = (layer.get_attn_backend().full_cls_name(), layer_spec, getattr(layer, "num_heads", 0))
             if key not in group_map:
                 group_map[key] = AttentionGroup(
