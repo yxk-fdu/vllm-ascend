@@ -31,9 +31,6 @@ from vllm_ascend.core.kv_cache_interface import (
 from vllm_ascend.device.hardware_profile import AttentionBackendFamily, get_current_hardware_profile
 from vllm_ascend.utils import _round_up, enable_dsa_cp, vllm_version_is
 
-GLM5_NEXT_SFA_KERNEL_BLOCK_SIZE = 128
-
-
 @dataclass
 class AscendIndexerKPoolQueryMetadata:
     """Token-local query addressing over the replicated pool cache."""
@@ -115,20 +112,28 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
         if not layer_names or any(not name.endswith(".indexer.k_cache") for name in layer_names):
             raise ValueError(f"Invalid Indexer KPool cache layer names: {layer_names}.")
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        # The scheduler/slot-mapping unit remains the manager block size.
         self.logical_block_size = vllm_config.cache_config.block_size
+        # AttentionGroup.create_metadata_builders() passes a copied spec whose
+        # block_size is the final per-group kernel block size.
+        self.kernel_block_size = kv_cache_spec.block_size
         self.storage_block_size = get_storage_block_size(kv_cache_spec)
         if self.storage_block_size <= 0:
             raise ValueError(f"Indexer KPool storage block size must be positive, got {self.storage_block_size}.")
         self.compress_ratio = compress_ratio
-        if self.logical_block_size % GLM5_NEXT_SFA_KERNEL_BLOCK_SIZE:
+        if self.kernel_block_size <= 0 or self.logical_block_size % self.kernel_block_size:
             raise ValueError(
-                "GLM-Next logical block size must be divisible by the SFA "
-                f"kernel block size: logical={self.logical_block_size}, "
-                f"kernel={GLM5_NEXT_SFA_KERNEL_BLOCK_SIZE}."
+                "GLM-Next logical block size must contain whole kernel blocks: "
+                f"logical={self.logical_block_size}, kernel={self.kernel_block_size}."
             )
-        self.kernel_row_block_size = GLM5_NEXT_SFA_KERNEL_BLOCK_SIZE // self.compress_ratio
+        if self.kernel_block_size % self.compress_ratio:
+            raise ValueError(
+                "GLM-Next kernel block size must be divisible by the compression "
+                f"ratio: kernel={self.kernel_block_size}, ratio={self.compress_ratio}."
+            )
+        self.kernel_row_block_size = self.kernel_block_size // self.compress_ratio
         # MTP tables count expanded kernel pages.
-        self.kernel_blocks_per_logical_block = self.logical_block_size // GLM5_NEXT_SFA_KERNEL_BLOCK_SIZE
+        self.kernel_blocks_per_logical_block = self.logical_block_size // self.kernel_block_size
         scheduler_config = vllm_config.scheduler_config
         self.use_dsa_cp = enable_dsa_cp()
         self.dsa_cp_size = get_tp_group().world_size if self.use_dsa_cp else 1

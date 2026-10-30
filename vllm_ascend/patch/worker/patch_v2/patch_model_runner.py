@@ -189,16 +189,28 @@ def initialize_kv_cache(
         self.speculator.init_cudagraph_manager(cudagraph_mode)
 
     # Capture warmup providers that depend on allocated KV-cache strides.
+    # Ascend builds backend-specific cache views inside allocate_kv_cache_main,
+    # so make the canonical groups (including draft groups) available during
+    # that allocation call. Their kernel_block_size fields were finalized by
+    # init_attn_backend().
+    from vllm_ascend.worker.v2.attn_utils import use_kv_allocation_attn_groups
+
+    allocation_attn_groups = (
+        group
+        for groups in self.attn_groups + getattr(self.speculator, "attn_groups", [])
+        for group in groups
+    )
     with self.jit_warmup_registry.activate():
-        kv_caches_dict = upstream.init_kv_cache(
-            self.compilation_config.static_forward_context,
-            self.kv_cache_config,
-            self.device,
-            self.kernel_block_sizes,
-            self.vllm_config,
-            kv_cache_allocation_context=kv_cache_allocation_context,
-            block_tables=self.block_tables,
-        )
+        with use_kv_allocation_attn_groups(allocation_attn_groups):
+            kv_caches_dict = upstream.init_kv_cache(
+                self.compilation_config.static_forward_context,
+                self.kv_cache_config,
+                self.device,
+                self.kernel_block_sizes,
+                self.vllm_config,
+                kv_cache_allocation_context=kv_cache_allocation_context,
+                block_tables=self.block_tables,
+            )
     register_sparse_kv_caches = getattr(self, "_register_sparse_kv_caches", None)
     if register_sparse_kv_caches is not None:
         register_sparse_kv_caches(kv_caches_dict)

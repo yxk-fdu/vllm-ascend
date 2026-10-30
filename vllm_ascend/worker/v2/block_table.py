@@ -30,14 +30,11 @@ from vllm_ascend.utils import vllm_version_is
 class AscendBlockTables(BlockTables):
     """Block table for Ascend NPUs."""
 
-    # TODO: Refactor this path to follow vLLM #57169: keep block tables at
-    # manager-block granularity and move the kernel-block mapping into
-    # AttentionGroup (kernel_block_table / map_to_kernel_block_table). This class
-    # should then stop expanding rows in __init__/append_block_ids, and the
-    # Ascend slot-mapping kernel should consume the mapped block table.
+    # Main vLLM follows #57169: public block tables stay at manager-block
+    # granularity and kernel-block mapping belongs to AttentionGroup. The
+    # v0.31 compatibility branch still keeps its legacy kernel-block layout.
 
     block_sizes_tensor: torch.Tensor
-    kernel_block_sizes_tensor: torch.Tensor
 
     if vllm_version_is("0.31.0"):
 
@@ -116,21 +113,10 @@ class AscendBlockTables(BlockTables):
         ):
             if kernel_block_sizes is None:
                 kernel_block_sizes = block_sizes
-            # vLLM #57169 dropped `kernel_block_sizes`/`blocks_per_kv_block` from
-            # `BlockTables` on main and stopped expanding the block tables. The
-            # Ascend triton slot-mapping kernel still addresses kernel blocks, so
-            # restore that layout locally: expose the kernel block sizes, expand
-            # the block-table rows by `blocks_per_kv_block`, and keep a tensor of
-            # the kernel block sizes for the kernel.
+            # vLLM #57169 keeps public block tables at KV-cache-manager
+            # granularity. Kernel-specific expansion is handled by
+            # AttentionGroup.
             self.kernel_block_sizes = kernel_block_sizes
-            self.blocks_per_kv_block = [
-                block_size // kernel_block_size
-                for block_size, kernel_block_size in zip(block_sizes, kernel_block_sizes)
-            ]
-            expanded_num_blocks_per_group = [
-                max_num_blocks * blocks_per_kv_block
-                for max_num_blocks, blocks_per_kv_block in zip(max_num_blocks_per_group, self.blocks_per_kv_block)
-            ]
             # vLLM main added a per-group ``dcp_sharded`` flag to BlockTables;
             # the v0.31.0 release lane has no such parameter, so only forward it
             # when the caller supplies it.
@@ -138,13 +124,12 @@ class AscendBlockTables(BlockTables):
             if dcp_sharded is not None:
                 super_kwargs["dcp_sharded"] = dcp_sharded
             # vLLM main's `BlockTables.__init__` has no `kernel_block_sizes`
-            # parameter, so it is not forwarded; the kernel-block layout is
-            # maintained here instead.
+            # parameter, so it is not forwarded.
             super().__init__(
                 block_sizes,
                 max_num_reqs,
                 max_num_batched_tokens,
-                expanded_num_blocks_per_group,
+                max_num_blocks_per_group,
                 device,
                 cp_size=cp_size,
                 cp_rank=cp_rank,
@@ -152,15 +137,13 @@ class AscendBlockTables(BlockTables):
                 slot_mapping_enabled=slot_mapping_enabled,
                 **super_kwargs,
             )
-            self.kernel_block_sizes_tensor = torch.tensor(kernel_block_sizes, dtype=torch.int32, device=self.device)
             self._triton_block_size = 1024
-            # kernel_block_sizes determine the number of block-table entries
-            # touched by one token tile. Use the smallest kernel block size to
-            # form one safe constexpr window for all groups, without staging a
-            # whole row.
-            if kernel_block_sizes:
-                min_kernel_block_size = min(kernel_block_sizes)
-                window_size = (self._triton_block_size + min_kernel_block_size - 1) // min_kernel_block_size + 1
+            # Public block tables are indexed with KV-cache block sizes on the
+            # main vLLM path, so size the staged window from those sizes.
+
+            if block_sizes:
+                min_block_size = min(block_sizes)
+                window_size = (self._triton_block_size + min_block_size - 1) // min_block_size + 1
                 self._block_table_window_size = triton.next_power_of_2(window_size)
             else:
                 # Encoder-only producers do not allocate decoder KV-cache groups.
@@ -185,14 +168,9 @@ class AscendBlockTables(BlockTables):
             new_block_ids: tuple[list[int], ...],
             overwrite: bool,
         ) -> None:
-            # vLLM #57169 stopped expanding block ids by `blocks_per_kv_block`
-            # on main; the Ascend block tables are kernel-block addressed, so
-            # restore the expansion (the v0.31.0 base already does it).
-            expanded_block_ids = tuple(
-                [block_id * blocks_per_kv_block + k for block_id in ids for k in range(blocks_per_kv_block)]
-                for ids, blocks_per_kv_block in zip(new_block_ids, self.blocks_per_kv_block)
-            )
-            return super().append_block_ids(req_index, expanded_block_ids, overwrite)
+            # Keep public block IDs at KV-cache-manager granularity. The
+            # AttentionGroup owns the kernel-granularity mapping.
+            return super().append_block_ids(req_index, new_block_ids, overwrite)
 
     def compute_slot_mappings(
         self,
@@ -216,7 +194,6 @@ class AscendBlockTables(BlockTables):
             self.block_table_ptrs,
             self.block_table_strides,
             self.block_sizes_tensor,
-            self.kernel_block_sizes_tensor,
             slot_mappings,
             slot_mappings.stride(0),
             self.cp_rank,

@@ -121,6 +121,9 @@ if TYPE_CHECKING:
 
 # MRV2's upstream _dummy_run drops runner-specific kwargs such as``skip_gdn_state_update``
 _SKIP_RING_STATE_UPDATE: ContextVar[bool] = ContextVar("_SKIP_RING_STATE_UPDATE", default=False)
+_KV_ALLOCATION_ATTN_GROUPS: ContextVar[tuple[AttentionGroup, ...] | None] = ContextVar(
+    "_KV_ALLOCATION_ATTN_GROUPS", default=None
+)
 
 
 @contextmanager
@@ -135,6 +138,22 @@ def skip_ring_state_update(enabled: bool):
 
 def ring_state_update_skipped() -> bool:
     return _SKIP_RING_STATE_UPDATE.get()
+
+
+@contextmanager
+def use_kv_allocation_attn_groups(attn_groups: Iterable[AttentionGroup]):
+    """Make the canonical attention groups available to Ascend allocation.
+
+    vLLM's ``init_kv_cache`` passes ``kernel_block_sizes`` to the allocator but
+    keeps ``attn_groups`` for the post-allocation mapping stage. Ascend builds
+    its backend-specific views inside the allocator, so it needs the canonical
+    per-AttentionGroup kernel block sizes during that stage as well.
+    """
+    token = _KV_ALLOCATION_ATTN_GROUPS.set(tuple(attn_groups))
+    try:
+        yield
+    finally:
+        _KV_ALLOCATION_ATTN_GROUPS.reset(token)
 
 
 def unwrap_mamba_kv_cache_groups(kv_cache_config: KVCacheConfig) -> KVCacheConfig:
@@ -554,6 +573,8 @@ def build_attn_metadata(
             common_metadata_callback(i, common_attn_metadata)
 
         for attn_group in attn_groups[i]:
+            # 虽然独立的获得builder 但是上级的blocksize 已经被kenral blocksize统一了 没办法单独获得自己需要的尺寸
+            # 此处是在旧逻辑的基础上进行的调用
             attn_metadata_builder = attn_group.get_metadata_builder(0)
             is_dsa_builder = isinstance(attn_metadata_builder, (AscendDSAMetadataBuilder, AscendDSACPMetadataBuilder))
             is_v41_builder = isinstance(attn_metadata_builder, AscendDSAV41MetadataBuilder)
@@ -600,17 +621,18 @@ def build_attn_metadata(
                     # branches in the graph even for a short dummy sequence.
                     full_graph_mode=full_graph_mode or for_cudagraph_capture,
                 )
-
+            # + metadata = attn_group.build_metadata 相当于里面做了一层适配
+            # 核心就是在这个地方的 创建metadata
             for variant_names, variant_common in metadata_variants:
                 if for_cudagraph_capture:
                     metadata = attn_metadata_builder.build_for_cudagraph_capture(
-                        variant_common,
+                        attn_group._with_kernel_block_table(variant_common),
                         **attn_metadata_extra_kwargs,
                     )
                 else:
                     if isinstance(attn_metadata_builder, GDNAttentionMetadataBuilder):
                         attn_metadata_extra_kwargs["num_actual_reqs"] = num_actual_reqs
-                    metadata = attn_metadata_builder.build(
+                    metadata = attn_group.build_metadata(
                         common_prefix_len=0,
                         common_attn_metadata=variant_common,
                         **attn_metadata_extra_kwargs,
@@ -1489,7 +1511,7 @@ def allocate_kv_cache_main(
     still consumes separate K/V (and backend-specific state) tensors, so keep
     the Ascend allocation/reshape contract behind the new entry point.
     """
-    del layout
+    del layout, kernel_block_sizes
     vllm_config = get_current_vllm_config()
     attn_layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)
     shared_layers = {
@@ -1504,22 +1526,51 @@ def allocate_kv_cache_main(
         device=device,
     )
 
-    attn_groups: list[AttentionGroup] = []
+    canonical_attn_groups = _KV_ALLOCATION_ATTN_GROUPS.get()
+    if canonical_attn_groups is None:
+        raise RuntimeError(
+            "Ascend KV-cache allocation requires the canonical AttentionGroup "
+            "objects created by init_attn_backend()."
+        )
+    configured_layers = {
+        layer_name
+        for group in kv_cache_config.kv_cache_groups
+        for layer_name in group.layer_names
+    }
+    # Keep the original per-AttentionGroup kernel_block_size selected by
+    # create_metadata_builders(). This is important for GLM groups where the
+    # main MLA and compressed indexer share manager block IDs but use different
+    # kernel block sizes.
+    attn_groups = [
+        group
+        for group in canonical_attn_groups
+        if any(layer_name in configured_layers for layer_name in group.layer_names)
+    ]
+
+    # Upstream does not create AttentionGroup objects for cache specs without
+    # layer views (for example Mamba/GDN state). Ascend still needs backend and
+    # spec information to build those physical views, so add only these
+    # non-attention fallback groups; attention groups always use the canonical
+    # objects above and their finalized kernel_block_size.
+    covered_layers = {
+        layer_name
+        for group in attn_groups
+        for layer_name in group.layer_names
+    }
     for group_id, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
         group_map: dict[tuple[str, KVCacheSpec, int], AttentionGroup] = {}
         group_order: list[tuple[str, KVCacheSpec, int]] = []
         for layer_name in kv_cache_group.layer_names:
-            if layer_name in shared_layers:
+            if layer_name in covered_layers or layer_name in shared_layers:
                 continue
             layer = attn_layers[layer_name]
             layer_spec = kv_cache_group.kv_cache_spec
             if isinstance(layer_spec, UniformTypeKVCacheSpecs):
                 layer_spec = layer_spec.kv_cache_specs[layer_name]
-            backend = layer.get_attn_backend()
-            key = (backend.full_cls_name(), layer_spec, getattr(layer, "num_heads", 0))
+            key = (layer.get_attn_backend().full_cls_name(), layer_spec, getattr(layer, "num_heads", 0))
             if key not in group_map:
                 group_map[key] = AttentionGroup(
-                    backend=backend,
+                    backend=layer.get_attn_backend(),
                     layer_names=[layer_name],
                     kv_cache_spec=layer_spec,
                     kv_cache_group_id=group_id,
@@ -1533,7 +1584,6 @@ def allocate_kv_cache_main(
         attn_groups=attn_groups,
         kv_cache_raw_tensors=raw_tensors,
         cache_dtype=vllm_config.cache_config.cache_dtype,
-        kernel_block_sizes=kernel_block_sizes,
         shared_kv_cache_layers=shared_layers,
         kv_cache_config=kv_cache_config,
     )
@@ -1563,7 +1613,6 @@ def _reshape_kv_cache_v2(
     attn_groups: Sequence[AttentionGroup],
     kv_cache_raw_tensors: dict[str, Any],
     cache_dtype: str,
-    kernel_block_sizes: list[int],
     shared_kv_cache_layers: dict[str, str],
     kv_cache_config: "KVCacheConfig | None" = None,
 ) -> dict[str, Any]:
@@ -1593,21 +1642,27 @@ def _reshape_kv_cache_v2(
     )
 
     for group in attn_groups:
-        if group.kv_cache_group_id >= len(kernel_block_sizes):
-            continue
-
         group_spec = group.kv_cache_spec
+        # This is the final logical/token-unit size selected for this specific
+        # AttentionGroup by upstream create_metadata_builders(). It is not the
+        # group-level kernel_block_sizes[] candidate used by the allocator.
+        logical_kernel_block_size = (
+            group.kernel_block_size or group_spec.block_size
+        )
+        # The physical view may use a different row unit for compressed MLA
+        # storage. Keep that conversion local to the view construction; it
+        # must not overwrite AttentionGroup.kernel_block_size.
         group_storage_block_size = get_storage_block_size(group_spec)
         kernel_block_size = (
             group_storage_block_size
             if group_storage_block_size != group_spec.block_size
-            else kernel_block_sizes[group.kv_cache_group_id]
+            else logical_kernel_block_size
         )
         if group_storage_block_size != group_spec.block_size and getattr(
             group_spec, "indexes_kv_by_block_stride", False
         ):
             compression_ratio = get_kv_cache_compression_ratio(group_spec)
-            kernel_block_size = kernel_block_sizes[group.kv_cache_group_id] // compression_ratio
+            kernel_block_size = logical_kernel_block_size // compression_ratio
 
         for layer_name in group.layer_names:
             if layer_name in shared_kv_cache_layers:
@@ -1767,6 +1822,9 @@ def _reshape_kv_cache_v2(
                 and getattr(kv_cache_spec, "model_version", None) == "glm5_next"
                 and get_kv_cache_compression_ratio(kv_cache_spec) > 1
             ):
+                # The GLM compressed-view helper accepts the logical
+                # scheduler-unit size and converts it to the compressed
+                # indexer-unit size internally.
                 kv_caches[layer_name] = view_compressed_indexer_cache(
                     layer_name,
                     kv_cache_spec,
