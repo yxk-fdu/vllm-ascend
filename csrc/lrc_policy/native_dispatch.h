@@ -220,6 +220,7 @@ class NativeCpuDispatcher {
   struct Channel {
     uint32_t* flag; uint32_t seen = 0;
     bool prefetch = false; Id prefetch_cap = 0;
+    Id dependency = -1;
     uintptr_t cpu, entry, args, ids, weights, mapping, ready, weight_ready;
     Id tokens, topk, layer; int id_size, map_size;
     std::shared_ptr<NativeHostPlanner> planner;
@@ -287,6 +288,11 @@ class NativeCpuDispatcher {
           uint32_t generation = __atomic_load_n(c.flag, __ATOMIC_ACQUIRE);
           if (generation == c.seen) continue;
           if (generation != uint32_t(c.seen + 1)) throw std::runtime_error("NPU input sequence skipped");
+          // Both captured channels advance once per replay. A flag may become
+          // visible between the demand and prefetch scans, so priority alone
+          // does not enforce FIFO. Admit this generation's demand first.
+          if (c.prefetch && c.dependency >= 0 &&
+              channels_[c.dependency]->seen != generation) continue;
           c.seen = generation;
           if (c.prefetch) {
             auto loads = c.planner->prepare_prefetch(c.ids, c.weights, c.mapping,
@@ -397,6 +403,12 @@ class NativeCpuDispatcher {
   unsigned add_prefetch(uintptr_t flag, uintptr_t ids, uintptr_t weights, uintptr_t mapping,
                         uintptr_t ready, Id tokens, Id topk, Id layer, int id_size, int map_size,
                         Id cap, std::shared_ptr<NativeHostPlanner> planner) {
+    return add_prefetch_after(flag, ids, weights, mapping, ready, tokens, topk,
+                              layer, id_size, map_size, cap, std::move(planner), -1);
+  }
+  unsigned add_prefetch_after(uintptr_t flag, uintptr_t ids, uintptr_t weights, uintptr_t mapping,
+                        uintptr_t ready, Id tokens, Id topk, Id layer, int id_size, int map_size,
+                        Id cap, std::shared_ptr<NativeHostPlanner> planner, Id dependency) {
     if (!flag || flag % alignof(uint32_t) || !ids || !weights || !mapping || !ready || !planner ||
         tokens < 1 || topk < 1 || cap < 1 || (id_size != 4 && id_size != 8) || (map_size != 4 && map_size != 8))
       throw std::invalid_argument("Invalid native prefetch registration");
@@ -405,6 +417,10 @@ class NativeCpuDispatcher {
     if (i == kMaxChannels || !alive_.load()) throw std::runtime_error("Native task registration is closed/full");
     auto c = std::make_unique<Channel>();
     c->flag = reinterpret_cast<uint32_t*>(flag); c->seen = __atomic_load_n(c->flag, __ATOMIC_ACQUIRE);
+    if (dependency < -1 || dependency >= Id(i) ||
+        (dependency >= 0 && channels_[dependency]->prefetch))
+      throw std::invalid_argument("Prefetch dependency must name an existing demand channel");
+    c->dependency = dependency;
     c->prefetch = true; c->prefetch_cap = cap; c->ids = ids; c->weights = weights; c->mapping = mapping;
     c->weight_ready = ready; c->tokens = tokens; c->topk = topk; c->layer = layer;
     c->id_size = id_size; c->map_size = map_size; c->planner = std::move(planner);

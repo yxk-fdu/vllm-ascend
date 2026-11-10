@@ -81,19 +81,20 @@ class NativePrefetchState:
         self.eager = {}
         self.by_mapping = {}
 
-    def stage(self, predicted, capturing):
+    def stage(self, predicted, capturing, dependency=None):
         from .cpu_backend.kt_kernel_backend import _graph_capture_active
 
         # npugraph_ex can capture outside the Python context wrapper. Each
         # real capture site must own its event even when that flag is false.
         capturing = capturing or _graph_capture_active()
         weights, ids = predicted
-        key = tuple(ids.shape)
+        key = (tuple(ids.shape), dependency)
         site = None if capturing else self.eager.get(key)
         if site is None:
             if len(self.sites) >= _MAX_SITES:
                 raise RuntimeError("Native prefetch capture-site limit reached")
             site = NativePrefetchSite(self.transfer, predicted, self.flags[len(self.sites)], capturing=capturing)
+            site.dependency = dependency
             self.sites.append(site)
             self.by_mapping[site.mapping.data_ptr()] = site
             if not capturing:
@@ -118,11 +119,14 @@ class NativePrefetchSite:
         self.weights = torch.empty(tuple(ids.shape), dtype=torch.float32, pin_memory=True)
         self.mapping = torch.empty(tuple(transfer.layer.log2phy.shape), dtype=transfer.layer.log2phy.dtype,
                                    pin_memory=True)
+        from .prepared_h2d import prepare_mapping_copy
+        self.mapping_task = prepare_mapping_copy(self.mapping, transfer.layer.log2phy)
         self.ready = NativePrefetchReadyEvent()
         if not self.ready.npu_event:
             raise RuntimeError("Native prefetch requires value-based ExternalEvent support")
         self.device_flag, self.host_flag = flags
         self.registered = False
+        self.dependency = None
 
     def dispatch(self, manager):
         from .cpu_backend import poll_submission
@@ -148,7 +152,8 @@ def stage_native_prefetch(manager, next_idx, predicted, capturing):
     state = getattr(transfer, "native_prefetch", None)
     if state is None:
         raise RuntimeError("Missing native prefetch target transfer")
-    site = state.stage(predicted, capturing)
+    context = getattr(manager, "_prefetch_demand_context", None)
+    site = state.stage(predicted, capturing, getattr(context, "native_channel", None))
     return site.ids, site.weights, site.mapping, site.mapping.numpy(), layer, next_idx, None
 
 

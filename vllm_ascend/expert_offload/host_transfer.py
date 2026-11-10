@@ -14,6 +14,7 @@ import torch_npu
 
 from .host_transfer_policy import HostTransferPolicy
 from .dma_submit_timing import stamp
+from .prepared_h2d import prepare_mapping_copy
 
 _LOG = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ class WeightRequest:
     loads: tuple
     ready: object
     timing: object = None
+    mapping_task: object = None
 
 
 class HostWeightWorker:
@@ -63,7 +65,10 @@ class HostWeightWorker:
                 self.manager._load_expert_weights_into_slots(transfer.layer, transfer.layer_idx, request.loads)
             else:
                 self.manager._load_expert_weights_into_slots(transfer.layer, transfer.layer_idx, request.loads, timing=timing)
-            request.mapping_device.copy_(request.mapping_host, non_blocking=True)
+            mapping_task = request.mapping_task
+            if mapping_task is None:
+                mapping_task = prepare_mapping_copy(request.mapping_host, request.mapping_device)
+            self.manager._get_h2d_transport().copy_batch((mapping_task,))
             stamp(timing, 'mapping_return')
             # Record on DMA itself after weights, quant attributes and mapping.
             # Never use the independent CPU-output completion stream here.
@@ -115,6 +120,7 @@ class HostTransferContext:
         self.mapping = torch.empty(
             transfer.layer.log2phy.shape, dtype=transfer.layer.log2phy.dtype, device="cpu", pin_memory=True
         )
+        self.mapping_task = prepare_mapping_copy(self.mapping, transfer.layer.log2phy)
         self.ready = torch_npu.npu.ExternalEvent()
         if not self.ready.npu_event:
             raise RuntimeError("Host DMA requires value-based ExternalEvent support")
@@ -132,7 +138,8 @@ class HostTransferContext:
             loads = transfer.native_planner.prepare(
                 ids.data_ptr(), weights.data_ptr(), self.mapping.data_ptr(),
                 ids.shape[0], ids.shape[1], ids.element_size(), self.mapping.element_size())
-            transfer.worker.submit(WeightRequest(transfer, self.mapping, transfer.layer.log2phy, loads, self.ready))
+            transfer.worker.submit(WeightRequest(transfer, self.mapping, transfer.layer.log2phy, loads, self.ready,
+                                                  mapping_task=self.mapping_task))
             return
         plan = transfer.policy.plan(ids.tolist(), weights.float().tolist(), self.mapping.tolist())
         # Full routes are observed first; CPU then computes only unassigned
@@ -140,13 +147,16 @@ class HostTransferContext:
         ids.copy_(torch.tensor(plan.cpu_ids, dtype=ids.dtype).reshape(ids.shape))
         weights.copy_(torch.tensor(plan.cpu_weights, dtype=weights.dtype).reshape(weights.shape))
         self.mapping.copy_(torch.tensor(plan.mapping, dtype=self.mapping.dtype))
-        transfer.worker.submit(WeightRequest(transfer, self.mapping, transfer.layer.log2phy, plan.loads, self.ready))
+        transfer.worker.submit(WeightRequest(transfer, self.mapping, transfer.layer.log2phy, plan.loads, self.ready,
+                                              mapping_task=self.mapping_task))
 
 
 class HostExpertTransfer:
     def __init__(self, manager, layer, backend, worker):
         self.layer, self.backend, self.worker = layer, backend, worker
         self.layer_idx = manager.moe_layers.index(layer)
+        # Also covers draft layers attached after the manager's finalization.
+        manager._prepare_expert_h2d_layer(layer, self.layer_idx)
         self._eager_contexts = {}
         self.policy = HostTransferPolicy(
             experts=manager.num_total_experts,

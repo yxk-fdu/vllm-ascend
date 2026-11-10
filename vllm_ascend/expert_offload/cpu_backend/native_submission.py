@@ -66,15 +66,18 @@ class NativePollWorker:
             ids[slot].element_size(), context.mapping.element_size(), context.transfer.native_planner)
         if native != index:
             raise RuntimeError("Native task registration mismatch")
+        context.native_channel = index
 
     def register_prefetch(self, site, cap):
         index = len(self.channels)
         self.channels.append((None, None, site.ready, site.host_flag, site, None))
         self.prefetch_sites[index] = site
-        native = self.engine.add_prefetch(
+        register = self.engine.add_prefetch_after if site.dependency is not None else self.engine.add_prefetch
+        dependency = (site.dependency,) if site.dependency is not None else ()
+        native = register(
             site.host_flag.data_ptr(), site.ids.data_ptr(), site.weights.data_ptr(), site.mapping.data_ptr(),
             int(site.ready.npu_event), site.ids.shape[0], site.ids.shape[1], site.transfer.layer_idx,
-            site.ids.element_size(), site.mapping.element_size(), cap, site.transfer.native_planner)
+            site.ids.element_size(), site.mapping.element_size(), cap, site.transfer.native_planner, *dependency)
         if native != index:
             raise RuntimeError("Native prefetch registration mismatch")
 
@@ -116,7 +119,7 @@ class NativePollWorker:
                 try:
                     context.transfer.worker._process(WeightRequest(
                         context.transfer, context.mapping, context.transfer.layer.log2phy,
-                        loads, context.ready, timing))
+                        loads, context.ready, timing, context.mapping_task))
                 finally:
                     self.dma_trace.end(timing)
         except BaseException:

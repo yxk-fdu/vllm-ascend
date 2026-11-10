@@ -380,6 +380,7 @@ PYBIND11_MODULE(_vllm_ascend_lrc, m) {
       .def(py::init<py::capsule, uintptr_t, uintptr_t, int, int>())
       .def("add", &NativeCpuDispatcher::add)
       .def("add_prefetch", &NativeCpuDispatcher::add_prefetch)
+      .def("add_prefetch_after", &NativeCpuDispatcher::add_prefetch_after)
       .def("prefetch_stats", &NativeCpuDispatcher::prefetch_stats)
       .def("next_weight", &NativeCpuDispatcher::next_weight, py::call_guard<py::gil_scoped_release>())
       .def("next_weight_details", &NativeCpuDispatcher::next_weight_details, py::call_guard<py::gil_scoped_release>())

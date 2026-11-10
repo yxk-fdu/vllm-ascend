@@ -844,13 +844,21 @@ class ExpertOffloadManager:
                 continue
             dev_tensor = getattr(layer, attr_name)
             dtype = dev_tensor.dtype
+            per_expert_strides = None
             if "scale_bias" in attr_name:
                 per_expert_shape = tuple(dev_tensor.shape[1:])
             elif dtype.itemsize == 1:
                 from vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4 import apply_mxfp4_weight_scale_layout
 
                 dtype = torch.uint8
-                per_expert_shape = tuple(apply_mxfp4_weight_scale_layout(dev_tensor[0].view(torch.uint8)).shape)
+                target_layout = apply_mxfp4_weight_scale_layout(dev_tensor[0].view(torch.uint8))
+                per_expert_shape = tuple(target_layout.shape)
+                if self.ep_size == 1:
+                    # Load directly into the final device strides. The logical
+                    # view still supports prefill/legacy Tensor copies, while
+                    # decode can copy these same bytes without a second slab.
+                    # Multi-rank SHARED pointers keep their existing contract.
+                    per_expert_strides = tuple(target_layout.stride())
             else:
                 per_expert_shape = (dev_tensor[0].numel(),)
             buffer_dict: dict = getattr(self, buffer_dict_name)
@@ -860,7 +868,10 @@ class ExpertOffloadManager:
             while len(buffers) <= layer_moe_idx:
                 buffers.append([])
             for _ in range(nalloc):
-                buffers[layer_moe_idx].append(self._allocate_expert_host_tensor(per_expert_shape, dtype))
+                buffer = self._allocate_expert_host_tensor(per_expert_shape, dtype)
+                if per_expert_strides is not None:
+                    buffer = buffer.as_strided(per_expert_shape, per_expert_strides)
+                buffers[layer_moe_idx].append(buffer)
 
     def _finalize_offload(self, model):
         """Post-weight-loading finalization.
@@ -1150,6 +1161,13 @@ class ExpertOffloadManager:
         Touch it only via untyped_storage() slicing, never through the tensor
         view. No-op for non-quantized (other dtype) models.
         """
+        prepared = getattr(self, "_prepared_expert_h2d", {})
+        if prepared:
+            # Cold reconfiguration only. Demand/prefetch DMA uses a different
+            # stream from load_stream; drain live graph consumers before any
+            # source or destination storage can be replaced.
+            torch.npu.synchronize()
+            prepared.clear()
         if self.native_mxfp4_enabled:
             self._require_native_weights_loaded()
             # Keep native bytes/scales on the host. Only device slot metadata
@@ -1489,9 +1507,9 @@ class ExpertOffloadManager:
     def _copy_scale_assembled(target: torch.Tensor, w1: torch.Tensor, w3: torch.Tensor) -> None:
         assembled = torch.cat([w1, w3], dim=0)
         if target.dtype == torch.uint8:
-            # W4A8_MXFP: store the post-layout bytes so the 1D buffer matches
-            # the post-process device slot element order (the device path
-            # applies reshape(...,k//2,2).transpose to the e8m0 scale).
+            # Apply the logical MXFP layout, then copy into the host view's
+            # strides. Single-rank buffers already use final device strides,
+            # so this initial load also produces the final physical bytes.
             from vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4 import apply_mxfp4_weight_scale_layout
 
             assembled = apply_mxfp4_weight_scale_layout(assembled.view(torch.uint8))
@@ -3646,6 +3664,7 @@ class ExpertOffloadManager:
         getattr(self, "_expert_h2d_views", {}).clear()
         getattr(self, "_retired_expert_h2d_views", []).clear()
         getattr(self, "_expert_h2d_tasks", {}).clear()
+        getattr(self, "_prepared_expert_h2d", {}).clear()
 
     def _cached_expert_h2d_view(self, key, owner, kind, argument=None):
         """Reuse metadata views, never expert contents or routing values.
@@ -3706,8 +3725,34 @@ class ExpertOffloadManager:
             cache[key] = task
         return task
 
+    def _prepare_expert_h2d_layer(self, layer, layer_idx):
+        """Build stable decode views after final format conversion, not per job."""
+        # A single-rank shard contains every expert; it is the default on 153.
+        # Only true multi-rank sharding needs the peer/local fallback path.
+        if self.native_mxfp4_enabled or (self.offload_config.shard_per_rank and self.ep_size != 1):
+            return
+        from .prepared_h2d import PreparedH2DUnsupportedLayout, PreparedLayerH2D
+
+        plans = getattr(self, "_prepared_expert_h2d", None)
+        if plans is None:
+            plans = self._prepared_expert_h2d = {}
+        try:
+            plan = PreparedLayerH2D(self, layer, layer_idx, _expert_weight)
+        except PreparedH2DUnsupportedLayout as error:
+            logger.warning("[EXPERT-H2D-PREPARED] layer=%d uses legacy quant copy: %s", layer_idx, error)
+            plans.pop(layer_idx, None)
+            return
+        plans[layer_idx] = plan
+        logger.info("[EXPERT-H2D-PREPARED] layer=%d fields=%d quant_fields=%d physical_storage_copy=True",
+                    layer_idx, len(plan.fields), len(plan.quant_fields))
+
     def _build_expert_h2d_tasks(self, layer, layer_idx, eid, slot) -> list[H2DCopyTask]:
         """Build format-preserving weight and quant H2D tasks for one expert."""
+        prepared = getattr(self, "_prepared_expert_h2d", {}).get(layer_idx)
+        if prepared is not None:
+            if prepared.layer is not layer:
+                raise RuntimeError("Prepared H2D layer changed; drain and rebuild descriptors")
+            return prepared.tasks(eid, slot)
         if self.native_mxfp4_enabled:
             return [self._native_upload_task(
                 layer_idx, eid, _expert_weight(layer, "w13_weight"), _expert_weight(layer, "w2_weight"),
@@ -3794,8 +3839,10 @@ class ExpertOffloadManager:
         # Keep derived NPU work behind all H2D submissions. The caller then
         # copies the mapping and publishes ready on this same DMA stream.
         trace.mark(CpuPrefetchPhase.SCALE_REFRESH_BEGIN)
-        for slot, _ in loads:
-            self._refresh_expert_fp32_scale(layer, slot)
+        plan = getattr(self, "_prepared_expert_h2d", {}).get(layer_idx)
+        if plan is None or not plan.provides_fp32_scale:
+            for slot, _ in loads:
+                self._refresh_expert_fp32_scale(layer, slot)
         trace.mark(CpuPrefetchPhase.SCALE_REFRESH_END)
         if timing is not None:
             stamp(timing, 'scale_refresh_return')

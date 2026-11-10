@@ -124,6 +124,7 @@ def apply_offloaded_experts(layer, hidden_states, topk_weights, topk_ids, router
         counter_sample = counters.begin(counter_layer, topk_ids, topk_weights,
                                         layer.log2phy, is_hash=layer.tid2eid is not None)
     hybrid_plan = None
+    prefetch_started_early = False
     cpu_moe_enabled = bool(getattr(mgr.offload_config.cpu_moe, "enabled", False))
 
     if cpu_moe_enabled and not layer.enable_multi_card:
@@ -134,8 +135,8 @@ def apply_offloaded_experts(layer, hidden_states, topk_weights, topk_ids, router
         # future shared ResidencyState commit point; do not pretend that the
         # device-prefetch mirror updates the host policy here.
         # Phase A joins this layer's pending prefetch and preprocesses routes.
-        # Phase B submits CPU work and waits for demand weights. Next-layer
-        # prefetch is triggered only after Phase B, before the GMM below.
+        # Phase B submits CPU work, prepares next-layer prediction, then
+        # joins demand weights. Native FIFO keeps demand DMA ahead of prefetch.
         prepared = begin_hybrid_routes(
             layer,
             hidden_states=hidden_states,
@@ -157,7 +158,25 @@ def apply_offloaded_experts(layer, hidden_states, topk_weights, topk_ids, router
                 mgr.moe_layers.index(layer), topk_ids, topk_weights
             )
         if prepared is not None:
-            hybrid_plan = prepared.finish()
+            def prepare_prefetch(cpu_task):
+                nonlocal prefetch_started_early
+                if not mgr.offload_config.expert_prefetch_enabled:
+                    return
+                context = getattr(cpu_task, "_host_context", None)
+                published = getattr(cpu_task, "_input_published_event", None)
+                if context is None or published is None or not hasattr(context, "native_channel"):
+                    return
+                # Join input publication, not demand weight completion. Prediction
+                # and D2H can now overlap current-layer H2D on the DMA stream.
+                torch.npu.current_stream().wait_event(published)
+                previous = getattr(mgr, "_prefetch_demand_context", None)
+                mgr._prefetch_demand_context = context
+                try:
+                    mgr.trigger_next_layer_prefetch(layer, hidden_states)
+                    prefetch_started_early = True
+                finally:
+                    mgr._prefetch_demand_context = previous
+            hybrid_plan = prepared.finish(before_weight_wait=prepare_prefetch)
     if hybrid_plan is not None:
         topk_ids = hybrid_plan.npu_topk_ids
         topk_weights = hybrid_plan.npu_topk_weights
@@ -227,11 +246,9 @@ def apply_offloaded_experts(layer, hidden_states, topk_weights, topk_ids, router
             )
         if hidden_states.dtype != torch.float8_e4m3fn:
             topk_weights = topk_weights.to(hidden_states.dtype)
-        # Demand-first trigger for hybrid and paging paths. The hybrid main
-        # stream has already joined its demand-weight ready event: captured
-        # prediction/D2H/notify cannot run ahead of this layer's DMA. CPU
-        # expert computation may still run in parallel with next-layer DMA.
-        if (not use_prefill
+        # Paging/fallback trigger. Native hybrid prediction was already staged
+        # before the demand-weight wait, with an explicit demand FIFO dependency.
+        if (not use_prefill and not prefetch_started_early
                 and (hybrid_plan is not None or num_tokens <= mgr.offload_threshold)):
             mgr.trigger_next_layer_prefetch(layer, hidden_states)
         _split_ctx = None

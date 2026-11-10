@@ -84,6 +84,7 @@ class HybridExpertExecutor:
         topk_weights: torch.Tensor,
         log2phy: torch.Tensor,
         transfer_manager=None,
+        before_weight_wait=None,
     ) -> HybridExpertPlan:
         """Submit CPU misses and produce a safe zero-weight NPU route.
 
@@ -123,6 +124,8 @@ class HybridExpertExecutor:
             cpu_task = self.backend.submit(
                 layer_idx=self.layer_idx, hidden_states=hidden_states,
                 topk_ids=topk_ids, topk_weights=topk_weights)
+            if before_weight_wait is not None:
+                before_weight_wait(cpu_task)
             cpu_task.wait_for_weights()
         valid_routes = (topk_ids >= 0) & (topk_ids < log2phy.numel()) & (topk_weights != 0)
         safe_ids = topk_ids.clamp(min=0, max=log2phy.numel() - 1).long()
@@ -199,9 +202,10 @@ class PreparedHybridRoutes:
     NOT submit the current layer's CPU MoE task yet.
 
     Phase B (``finish``) performs CPU input copies/backend submission and
-    joins demand-weight readiness on the main stream. The caller launches
-    next-layer prefetch after this phase, so speculative DMA cannot delay
-    this layer's demand DMA. CPU compute completion remains independent.
+    lets the caller stage native prefetch before joining demand weights.
+    Native channel dependencies admit demand before prefetch to one FIFO;
+    the DMA worker submits demand fully before dequeuing prefetch. CPU
+    compute completion remains independent of weight readiness.
     """
 
     def __init__(self, executor, *, hidden_states, topk_ids, topk_weights,
@@ -213,13 +217,14 @@ class PreparedHybridRoutes:
         self._log2phy = log2phy
         self._transfer_manager = transfer_manager
 
-    def finish(self) -> HybridExpertPlan:
+    def finish(self, before_weight_wait=None) -> HybridExpertPlan:
         return self._executor.prepare(
             hidden_states=self._hidden_states,
             topk_ids=self._topk_ids,
             topk_weights=self._topk_weights,
             log2phy=self._log2phy,
             transfer_manager=self._transfer_manager,
+            before_weight_wait=before_weight_wait,
         )
 
 
