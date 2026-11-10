@@ -3,3 +3,4 @@ include native_dispatch.h
 include kt_dispatch_api.h
 include npu_prefetch_wait.cpp
 include setup_npu_wait.py
+include native_dma.h

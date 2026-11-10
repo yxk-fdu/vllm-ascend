@@ -21,8 +21,9 @@ implementation. The recorded graph consumes and clears that value.
 CPU results and expert weights use independent readiness values and streams.
 When admission produces no loads, the mapping is unchanged, so C++ publishes
 weight readiness directly without a redundant mapping copy. Non-empty expert
-loads are handed to a separate Python DMA worker; they never gate native CPU
-submission or CPU completion. Eager/prefill retains its existing execution
+loads are consumed by a separate C++ DMA thread; it never returns through
+pybind or reacquires GIL between jobs. It never gates native CPU submission
+or CPU completion. Eager/prefill retains its existing execution
 path, using the same native planner and shared LRC state.
 
 ## Native prefetch and demand-first DMA
@@ -33,9 +34,12 @@ Python host callback to start either path. Predicted next-layer routes read
 that layer's existing C++ LRC history; only actual demand routes update LRC.
 CPU computation, CPU completion and DMA submission remain separate workers.
 
-The main stream joins current-layer demand weights before triggering next-layer
-prefetch, then submits the current NPU MoE computation. This ordering keeps
-speculative copies behind current demand copies on the DMA stream. A load
+After publishing current-layer input, the NPU may predict and stage next-layer
+prefetch while demand DMA is in flight. The C++ monitor admits this generation's
+demand before its dependent prefetch and queues both on the same FIFO DMA
+worker/stream. Prefetch preparation need not wait for demand DMA completion;
+its actual copies cannot overtake the current demand. Zero-load demand still
+advances the dependency and publishes ready through its separate stream. A load
 builds and submits one expert's weights/scales before preparing the next expert,
 rather than constructing every expert before the first copy can start. Publish
 mapping and readiness only after every required weight and scale operation.
@@ -100,7 +104,10 @@ native input/planning thread; `KT_MOE_COMPLETION_CPU` controls the native
 completion thread. `cpu_moe.native_dispatch_dma_cpu` controls weight DMA;
 its default uses the completion CPU. All must be outside the computation
 workers' physical cores, including SMT siblings. The verified 153 setup uses
-compute 32–61, poll 62, completion 63 and DMA 127 (a communication-core sibling).
+compute 32–61, poll 62, completion 63 and DMA 31 (SMT sibling 95, outside
+compute/communication physical cores). The DMA thread explicitly binds its
+configured core even if it lies outside the inherited NUMA-1 process affinity;
+the OS still enforces cgroup/cpuset constraints.
 
 ## Validation
 
@@ -114,3 +121,33 @@ for a native task, checks five exactly-once generations, and verifies that
 both independent external values release the captured graph. Run this only
 with the intended NPU explicitly selected; then validate actual model outputs
 and benchmark with profiling disabled.
+
+## Native DMA ownership and profiling
+
+Python loads/pins weights, prepares their final physical layout, creates the
+streams and events, registers pointer/byte tables, and retains all owners.
+The native worker copies each expert's fields, then log2phy, then publishes
+ready on the same DMA stream using `aclrtMemcpyAsync`/`aclrtValueWrite`. It
+neither converts tensors nor calls Python. The C++ submit return means queued,
+not device completion; the graph's ready wait remains required. Eager/prefill
+keeps the existing Torch path. Unsupported prepared layouts fail registration
+explicitly rather than silently changing the graph execution path.
+
+Registered plans reject loader writes, buffer replacement and reformatting.
+Shutdown first retires graph consumers, stops/joins the monitor, drains the
+completion and DMA queues, and synchronizes the DMA stream before releasing
+buffer owners. The manager closes native DMA before clearing prepared views.
+
+Profile-only timestamps go into a bounded C++ array (4096 jobs, with an explicit
+dropped count). There is no Python logger or shared trace mutex in the DMA hot
+path. Stop-profile converts records and writes `cpu_native_dma_submit_PID.jsonl`
+with monotonic/wall-clock anchors. These are native submission records, not the
+old Python `cpu_dma_submit` schema; consumers must use the new event name and
+must not interpret submit timestamps as device start/end times.
+
+`native_dma_cpu_check.py` uses an isolated fake ACL DSO to check ordering,
+GIL independence, invalid registrations, resident-only notification and close
+queue draining. `native_dma_npu_check.py` verifies actual DMA, strided scale,
+log2phy and external-ready joins across eight graph replays for demand,
+prefetch, resident-only, all-CPU and multi-expert pipeline cases. Its CPU expert task is a test fixture,
+not a numerical MoE kernel or an end-to-end throughput measurement.

@@ -3,6 +3,7 @@
 #include <pybind11/pybind11.h>
 #include <atomic>
 #include <chrono>
+#include <dlfcn.h>
 #include "kt_dispatch_api.h"
 namespace py = pybind11;
 struct Task { std::atomic<unsigned> executed{0}; };
@@ -27,5 +28,14 @@ PYBIND11_MODULE(_native_dispatch_fixture, m) {
     while (ptr->executed.load(std::memory_order_acquire) < target)
       if (std::chrono::steady_clock::now() > end) return false;
     return ptr->executed.load() == target;
+  });
+  // A host sentinel written by DMA after the device-ready wait: Python stays
+  // inside this C++ call holding GIL until the entire pipeline completes.
+  m.def("wait_value_holding_gil", [](uintptr_t address, uint64_t target) {
+    auto* ptr = reinterpret_cast<uint64_t*>(address);
+    auto end = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (__atomic_load_n(ptr, __ATOMIC_ACQUIRE) != target)
+      if (std::chrono::steady_clock::now() > end) return false;
+    return true;
   });
 }

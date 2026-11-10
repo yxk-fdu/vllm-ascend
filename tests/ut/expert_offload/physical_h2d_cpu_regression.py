@@ -35,7 +35,7 @@ module=types.ModuleType('vllm_ascend.expert_offload.prepared_h2d');module.__pack
 plan_type=module.PreparedLayerH2D
 env['prepare_mapping_copy']=module.prepare_mapping_copy
 source=ast.parse((D/'expert_offload_manager.py').read_text());cls=next(n for n in source.body if isinstance(n,ast.ClassDef) and n.name=='ExpertOffloadManager')
-names={'_init_layer_scale_buffers','_copy_scale_assembled','_copy_scale_direct','_load_scale_shard','_get_h2d_transport','_cached_expert_h2d_view','_cached_expert_h2d_task','_expert_src_storage','_build_quant_attr_h2d_tasks','_build_expert_h2d_tasks','_build_prefill_h2d_tasks','_load_expert_weights_into_slots','_refresh_expert_fp32_scale','process_weights_after_loading','_synchronize_h2d'}
+names={'_assert_native_dma_reload_safe','_init_layer_scale_buffers','_copy_scale_assembled','_copy_scale_direct','_load_scale_shard','_get_h2d_transport','_cached_expert_h2d_view','_cached_expert_h2d_task','_expert_src_storage','_build_quant_attr_h2d_tasks','_build_expert_h2d_tasks','_build_prefill_h2d_tasks','_load_expert_weights_into_slots','_refresh_expert_fp32_scale','process_weights_after_loading','_synchronize_h2d'}
 if any(isinstance(n,ast.FunctionDef) and n.name=='_prepare_expert_h2d_layer' for n in cls.body):names.add('_prepare_expert_h2d_layer')
 methods=[n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name in names];assert len(methods)==len(names)
 env['logger']=logging.getLogger('h2d-regression')
@@ -81,6 +81,22 @@ class Fixture:
   else:self.manager._prepared_expert_h2d={0:plan_type(self.manager,self.layer,0,env['_expert_weight'])}
 
 class Tests(unittest.TestCase):
+ def test_native_table_owns_exact_existing_buffers(self):
+  f=Fixture();f.prepare();plan=f.manager._prepared_expert_h2d[0]
+  owners=tuple(plan.owners)
+  src,dst,sizes,experts,slots=plan.native_dma_table()
+  self.assertEqual((experts,slots),(3,2))
+  self.assertEqual(src,[[s.data_ptr() for s in field[0]] for field in plan.fields])
+  self.assertEqual(dst,[[s.data_ptr() for s in field[1]] for field in plan.fields])
+  self.assertEqual(sizes,[8,4,16]);self.assertEqual(tuple(map(id,plan.owners)),tuple(map(id,owners)))
+ def test_native_live_buffers_reject_reload_and_rebuild(self):
+  f=Fixture();f.prepare();plan=f.manager._prepared_expert_h2d[0];plan.native_dma_live=True
+  with self.assertRaisesRegex(RuntimeError,'reloading'):f.manager._assert_native_dma_reload_safe(0)
+  with self.assertRaisesRegex(RuntimeError,'rebuilding'):f.prepare()
+  with self.assertRaisesRegex(RuntimeError,'reformatting'):f.manager.process_weights_after_loading()
+  self.assertIs(f.manager._prepared_expert_h2d[0],plan)
+  plan.native_dma_live=False;f.prepare()
+
  def test_cold_hook_covers_initial_and_late_layers(self):
   f=Fixture();m=f.manager;m.moe_layers=[f.layer];m.offload_config.cpu_moe=NS(native_dispatch=False);m.num_device_experts_for_layer=lambda i:2;m.cache_policy=None
   Transfer(m,f.layer,NS(),NS());self.assertIs(m._prepared_expert_h2d[0].layer,f.layer)

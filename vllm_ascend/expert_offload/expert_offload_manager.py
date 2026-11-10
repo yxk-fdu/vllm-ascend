@@ -1162,6 +1162,8 @@ class ExpertOffloadManager:
         view. No-op for non-quantized (other dtype) models.
         """
         prepared = getattr(self, "_prepared_expert_h2d", {})
+        if any(getattr(plan, "native_dma_live", False) for plan in prepared.values()):
+            raise RuntimeError("Close native DMA before reformatting expert buffers")
         if prepared:
             # Cold reconfiguration only. Demand/prefetch DMA uses a different
             # stream from load_stream; drain live graph consumers before any
@@ -1586,8 +1588,14 @@ class ExpertOffloadManager:
         local = global_eid - self._shard_base
         return local if 0 <= local < self._shard_size else None
 
+    def _assert_native_dma_reload_safe(self, layer_idx):
+        plan = getattr(self, "_prepared_expert_h2d", {}).get(layer_idx)
+        if getattr(plan, "native_dma_live", False):
+            raise RuntimeError("Close native DMA before reloading expert buffers")
+
     def load_w13(self, layer_moe_idx: int, expert_id: int, loaded_weight: torch.Tensor, shard_id: str):
         """Store w1/w3 shard to CPU buffer (transposed) via the load pool."""
+        self._assert_native_dma_reload_safe(layer_moe_idx)
         self._weight_load_calls += 1
         if self.native_mxfp4_enabled:
             self._load_native_field(layer_moe_idx, expert_id, shard_id, "weight", loaded_weight)
@@ -1608,6 +1616,7 @@ class ExpertOffloadManager:
 
     def load_w2(self, layer_moe_idx: int, expert_id: int, loaded_weight: torch.Tensor):
         """Store w2 weight to CPU buffer (transposed) via the load pool."""
+        self._assert_native_dma_reload_safe(layer_moe_idx)
         self._weight_load_calls += 1
         if self.native_mxfp4_enabled:
             self._load_native_field(layer_moe_idx, expert_id, "w2", "weight", loaded_weight)
@@ -1634,6 +1643,7 @@ class ExpertOffloadManager:
         _scale_shard_temp and assemble when the second shard arrives.
         w2 scale/offset is a single shard — clone and defer directly.
         """
+        self._assert_native_dma_reload_safe(layer_moe_idx)
         self._weight_load_calls += 1
         if self.native_mxfp4_enabled:
             if attr_name not in ("w13_weight_scale", "w2_weight_scale"):
@@ -3635,6 +3645,10 @@ class ExpertOffloadManager:
 
     def close(self) -> None:
         """Release H2D backend resources; safe to call more than once."""
+        native_dma = getattr(self, "_native_dma_worker", None)
+        if native_dma is not None:
+            native_dma.close()
+            self._native_dma_worker = None
         weight_worker = getattr(self, "_host_weight_worker", None)
         if weight_worker is not None:
             weight_worker.close()
@@ -3736,6 +3750,8 @@ class ExpertOffloadManager:
         plans = getattr(self, "_prepared_expert_h2d", None)
         if plans is None:
             plans = self._prepared_expert_h2d = {}
+        if getattr(plans.get(layer_idx), "native_dma_live", False):
+            raise RuntimeError("Close native DMA before rebuilding expert buffers")
         try:
             plan = PreparedLayerH2D(self, layer, layer_idx, _expert_weight)
         except PreparedH2DUnsupportedLayout as error:

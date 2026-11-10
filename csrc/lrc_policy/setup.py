@@ -13,7 +13,7 @@ setup(
         Pybind11Extension(
             "_vllm_ascend_lrc",
             ["lrc.cpp"],
-            depends=["load_submit.h", "native_dispatch.h", "kt_dispatch_api.h"],
+            depends=["load_submit.h", "native_dispatch.h", "native_dma.h", "kt_dispatch_api.h"],
             cxx_std=17,
             extra_compile_args=["/O2", "/fp:strict"] if os.name == "nt" else ["-O3", "-ffp-contract=off"],
         )

@@ -378,6 +378,12 @@ PYBIND11_MODULE(_vllm_ascend_lrc, m) {
       .def("prepare", &NativeHostPlanner::prepare);
   py::class_<NativeCpuDispatcher>(m, "NativeCpuDispatcher")
       .def(py::init<py::capsule, uintptr_t, uintptr_t, int, int>())
+      .def("configure_dma", &NativeCpuDispatcher::configure_dma)
+      .def("add_dma_layer", &NativeCpuDispatcher::add_dma_layer)
+      .def("bind_dma_channel", &NativeCpuDispatcher::bind_dma_channel)
+      .def("dma_stats", &NativeCpuDispatcher::dma_stats)
+      .def("set_dma_capture", &NativeCpuDispatcher::set_dma_capture, py::call_guard<py::gil_scoped_release>())
+      .def("dma_timings", &NativeCpuDispatcher::dma_timings)
       .def("add", &NativeCpuDispatcher::add)
       .def("add_prefetch", &NativeCpuDispatcher::add_prefetch)
       .def("add_prefetch_after", &NativeCpuDispatcher::add_prefetch_after)

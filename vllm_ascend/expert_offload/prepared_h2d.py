@@ -101,6 +101,7 @@ class _PreparedQuantField:
 class PreparedLayerH2D:
     def __init__(self, manager, layer, layer_idx, weight):
         self.layer = layer
+        self.native_dma_live = False
         self.fields = []
         self.quant_fields = []
         self.owners = []
@@ -147,6 +148,20 @@ class PreparedLayerH2D:
         self.quant_fields.append(field)
         self.fields.append((field.sources, field.destinations, (field.nbytes,) * self.num_experts, name))
         return field
+
+    def native_dma_table(self):
+        """Export stable physical pointers once; self owns every backing buffer."""
+        sources, destinations, sizes = [], [], []
+        for src, dst, lengths, _ in self.fields:
+            if not lengths or any(n != lengths[0] for n in lengths):
+                raise ValueError("Native DMA requires fixed field size per expert")
+            sources.append([s.data_ptr() for s in src])
+            destinations.append([d.data_ptr() for d in dst])
+            sizes.append(lengths[0])
+        for field in self.quant_fields:
+            for eid in range(self.num_experts):
+                field.validate(eid)
+        return sources, destinations, sizes, self.num_experts, self.num_slots
 
     def tasks(self, eid, slot):
         if not 0 <= eid < self.num_experts or not 0 <= slot < self.num_slots:

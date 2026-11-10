@@ -1,15 +1,16 @@
 """Register pinned tasks once; native poll/compute/completion never enter Python."""
 
 import atexit
+import json
 import logging
 import os
 import threading
 import time
+from pathlib import Path
 
 import torch
 import torch_npu
 
-from vllm_ascend.expert_offload.host_transfer import WeightRequest
 
 _LOG = logging.getLogger(__name__)
 
@@ -26,17 +27,42 @@ class NativePollWorker:
             kt_kernel_ext.native_dispatch_api(), int(self.stream.npu_stream), int(self.weight_stream.npu_stream),
             int(os.environ.get("KT_MOE_POLL_CPU", "6")),
             int(os.environ.get("KT_MOE_COMPLETION_CPU", "7")))
-        from ..dma_submit_timing import DmaSubmitTrace
-        self.dma_trace = DmaSubmitTrace()
+        self._dma_layers = {}
+        self._dma_stream = None
+        self._dma_capture_directory = None
+        self._dma_clock = None
         self.channels = []
         self.prefetch_sites = {}
         self._closed = False
         self._close_lock = threading.Lock()
-        self.dma_thread = threading.Thread(target=self._dma, name="kt_native_dma", daemon=True)
-        self.dma_thread.start()
         atexit.register(self.close)
         _LOG.info("CPU MoE native dispatch: input flag -> C++ planner -> CPUInfer; "
-                  "native completion records the external event; Python handles weight DMA only")
+                  "native completion and DMA never return to Python during replay")
+
+    def _register_dma_layer(self, transfer):
+        manager = transfer.worker.manager
+        plan = getattr(manager, "_prepared_expert_h2d", {}).get(transfer.layer_idx)
+        if plan is None:
+            raise RuntimeError("Native DMA requires prepared physical expert buffers")
+        if self._dma_stream is None:
+            self.engine.configure_dma(transfer.native_dma_cpu, int(transfer.worker.stream.npu_stream))
+            self._dma_stream = transfer.worker.stream
+        elif int(self._dma_stream.npu_stream) != int(transfer.worker.stream.npu_stream):
+            raise RuntimeError("A native dispatcher must use one shared weight DMA stream")
+        key = (id(manager), transfer.layer_idx)
+        cached = self._dma_layers.get(key)
+        if cached is None:
+            index = self.engine.add_dma_layer(*plan.native_dma_table())
+            # Keep Python owners until the C++ queue and DMA stream are drained.
+            # Registration is cold; the native consumer stores only raw bytes.
+            plan.native_dma_live = True
+            self._dma_layers[key] = (index, plan)
+            manager._native_dma_worker = self
+        else:
+            index, previous = cached
+            if previous is not plan:
+                raise RuntimeError("Close native DMA before replacing expert buffers")
+        return index
 
     def register(self, backend, hidden, stream, ready, hostflag, before_submit=None):
         from kt_kernel import kt_kernel_ext
@@ -57,6 +83,7 @@ class NativePollWorker:
             batches[slot].data_ptr(), ids[slot].size(-1), ids[slot].data_ptr(),
             weights[slot].data_ptr(), inputs[slot].data_ptr(), outputs[slot].data_ptr(), False)
         # Owners remain alive until graphs have retired and native threads joined.
+        dma_layer = self._register_dma_layer(context.transfer)
         index = len(self.channels)
         self.channels.append((backend, hidden, ready, hostflag, context, task))
         native = self.engine.add(
@@ -66,9 +93,12 @@ class NativePollWorker:
             ids[slot].element_size(), context.mapping.element_size(), context.transfer.native_planner)
         if native != index:
             raise RuntimeError("Native task registration mismatch")
+        self.engine.bind_dma_channel(index, dma_layer, context.transfer.layer.log2phy.data_ptr(),
+                                     context.mapping.numel() * context.mapping.element_size())
         context.native_channel = index
 
     def register_prefetch(self, site, cap):
+        dma_layer = self._register_dma_layer(site.transfer)
         index = len(self.channels)
         self.channels.append((None, None, site.ready, site.host_flag, site, None))
         self.prefetch_sites[index] = site
@@ -80,54 +110,28 @@ class NativePollWorker:
             site.ids.element_size(), site.mapping.element_size(), cap, site.transfer.native_planner, *dependency)
         if native != index:
             raise RuntimeError("Native prefetch registration mismatch")
-
-    @torch.inference_mode()
-    def _dma(self):
-        try:
-            torch.npu.set_device(self.device)
-            bound = False
-            while True:
-                index, loads, task, queued, dequeued, dequeued_cpu = self.engine.next_weight_details()
-                resumed, resumed_cpu = time.monotonic_ns(), time.thread_time_ns()
-                timing = None
-                if index < 4096 and self.dma_trace.enabled:
-                    timing = self.dma_trace.begin({
-                        'event': 'cpu_moe.dma_submit', 'channel': index, 'task_id': task,
-                        'experts': len(loads), 'prefetch': index in self.prefetch_sites,
-                        'cpp_enqueue_ns': queued, 'cpp_dequeue_ns': dequeued,
-                        'cpp_dequeue_cpu_ns': dequeued_cpu, 'python_resume_ns': resumed,
-                        'python_resume_cpu_ns': resumed_cpu, 'native_tid': threading.get_native_id(),
-                        'wall_ns': time.time_ns(), 'reference_mono_ns': time.monotonic_ns()})
-                if index >= 4096:
-                    return
-                context = self.channels[index][4]
-                if not bound:
-                    cpu = context.transfer.native_dma_cpu
-                    os.sched_setaffinity(0, {cpu})
-                    bound = True
-                # This stage is independent of native CPU submit and completion.
-                if index in self.prefetch_sites:
-                    manager = context.transfer.worker.manager
-                    manager._host_prefetch_calls += 1
-                    manager._host_prefetch_loads += len(loads)
-                    if manager._host_prefetch_calls == 1 or manager._host_prefetch_calls % 1024 == 0:
-                        _LOG.info("[NATIVE-PREFETCH] transfers=%d experts=%d native_notifications=%d planned_experts=%d",
-                                  manager._host_prefetch_calls, manager._host_prefetch_loads,
-                                  *self.engine.prefetch_stats())
-                if timing is not None:
-                    timing['layer'] = context.transfer.layer_idx
-                try:
-                    context.transfer.worker._process(WeightRequest(
-                        context.transfer, context.mapping, context.transfer.layer.log2phy,
-                        loads, context.ready, timing, context.mapping_task))
-                finally:
-                    self.dma_trace.end(timing)
-        except BaseException:
-            _LOG.exception("Native CPU MoE weight DMA failed; refusing stale output")
-            os._exit(1)
+        self.engine.bind_dma_channel(index, dma_layer, site.transfer.layer.log2phy.data_ptr(),
+                                     site.mapping.numel() * site.mapping.element_size())
 
     def set_dma_capture(self, enabled, directory):
-        self.dma_trace.set_capture(enabled, directory)
+        if enabled:
+            if not directory:
+                raise ValueError("Native DMA capture requires an output directory")
+            self._dma_capture_directory = Path(directory)
+            self._dma_clock = {"reference_mono_ns": time.monotonic_ns(), "wall_ns": time.time_ns()}
+        self.engine.set_dma_capture(enabled)
+        if not enabled and self._dma_capture_directory is not None:
+            records = self.engine.dma_timings()
+            self._dma_capture_directory.mkdir(parents=True, exist_ok=True)
+            path = self._dma_capture_directory / f"cpu_native_dma_submit_{os.getpid()}.jsonl"
+            with path.open("a") as output:
+                for record in records:
+                    record["event"] = "cpu_moe.native_dma_submit" if "channel" in record else "cpu_moe.native_dma_flush"
+                    record["pid"] = os.getpid()
+                    record.update(self._dma_clock)
+                    output.write(json.dumps(record, separators=(",", ":")) + "\n")
+            self._dma_capture_directory = None
+            self._dma_clock = None
 
     def close(self):
         with self._close_lock:
@@ -135,8 +139,7 @@ class NativePollWorker:
                 return
             torch.npu.synchronize(self.device)
             self.engine.close()
-            self.dma_thread.join(timeout=5)
-            if self.dma_thread.is_alive():
-                raise RuntimeError("Native DMA worker did not retire")
+            for _, plan in self._dma_layers.values():
+                plan.native_dma_live = False
             _LOG.info("CPU MoE native dispatcher retired: submitted=%d completed=%d", *self.engine.stats())
             self._closed = True
