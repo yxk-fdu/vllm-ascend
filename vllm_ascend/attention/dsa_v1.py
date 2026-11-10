@@ -354,9 +354,11 @@ class AscendDSABackend(AttentionBackend):
         tokens = get_storage_block_size(spec)
         prefix = (num_blocks, spec.num_kv_heads, tokens)
         shapes = [(*prefix, spec.head_size * spec.dtype.itemsize)]
+        dtypes = [spec.dtype]
         if getattr(spec, "scale_dim", 0):
             shapes.append((*prefix, spec.scale_dim * spec.scale_dtype.itemsize))
-        return tuple(shapes)
+            dtypes.append(spec.scale_dtype)
+        return KVCacheRuntimeShapes(shapes=tuple(shapes), dtypes=tuple(dtypes))
 
     @staticmethod
     def get_scale_shape(num_blocks: int, block_size: int, scale_size: int) -> tuple[int, ...]:
