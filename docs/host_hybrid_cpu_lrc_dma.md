@@ -42,6 +42,9 @@ Use vLLM 0.30.0 and build kt-kernel from
 Set `cpu_moe.weight_format="nz_mxfp4"`, `native_dispatch=true`, and
 `threadpool_count=1`. Place the host DMA buffers and compute pool on the
 same NUMA node. Leave `cpu_moe.weight_path` empty.
+Set `KT_MOE_MATCH_NPU_MXFP8=1` before loading the backend. The graph dispatcher
+also needs `KT_MOE_POLL_LIBRARY` set before backend creation, as described above.
+This native graph path currently requires an x86 host.
 
 The offload manager converts expert weights and scales during model loading
 and owns those buffers. It passes the four finalized fields to kt-kernel's
