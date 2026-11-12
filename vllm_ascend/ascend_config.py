@@ -1768,7 +1768,7 @@ class CpuMoeConfig:
         "enabled": False,
         # Only the ktransformers LLAMAFILE MoE wrapper is implemented today.
         "backend": "kt_kernel",
-        "weight_format": "gguf",  # or native_mxfp4 checkpoint directory
+        "weight_format": "gguf",  # nz_mxfp4 borrows finalized DMA sources
         # Per-layer GGUF template, literal or containing "{layer_idx}".
         # Expanded per layer by KtKernelBackendConfig.resolved_weight_path().
         "weight_path": "",
@@ -1931,10 +1931,12 @@ class CpuMoeConfig:
         if self.config["backend"] not in ("kt_kernel", ):
             raise ValueError("cpu_moe.backend must be 'kt_kernel'; got "
                              f"{self.config['backend']!r}")
-        if self.config["weight_format"] not in ("gguf", "native_mxfp4"):
-            raise ValueError("cpu_moe.weight_format must be gguf or native_mxfp4")
-        if self.config["weight_format"] == "native_mxfp4" and self.config["threadpool_count"] != 1:
-            raise ValueError("Native MXFP4 currently requires one NUMA pool")
+        if self.config["weight_format"] not in ("gguf", "nz_mxfp4"):
+            raise ValueError("cpu_moe.weight_format must be gguf or nz_mxfp4")
+        if self.config["weight_format"] == "nz_mxfp4" and not self.config["native_dispatch"]:
+            raise ValueError("Shared NZ CPU requires native_dispatch=true")
+        if self.config["weight_format"] == "nz_mxfp4" and self.config["threadpool_count"] != 1:
+            raise ValueError("Shared NZ CPU requires one NUMA pool")
         if not isinstance(self.config["weight_path"], str):
             raise TypeError("cpu_moe.weight_path must be a string")
         for key in ("cpuinfer_threads", "threadpool_count", "max_num_tokens"):
@@ -1955,7 +1957,7 @@ class CpuMoeConfig:
         if not self.config["enabled"]:
             return
         weight_path = self.config["weight_path"]
-        if not weight_path:
+        if not weight_path and self.config["weight_format"] != "nz_mxfp4":
             raise ValueError(
                 "cpu_moe.weight_path must not be empty when "
                 "cpu_moe.enabled=True")

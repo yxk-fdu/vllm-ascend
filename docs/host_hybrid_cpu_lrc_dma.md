@@ -29,13 +29,25 @@ The installed kt-kernel must expose pinned input/output buffers and the existing
 completion runtime. Mapped combine and value-based `ExternalEvent` support
 remain required.
 
-Select `h2d_backend="torch"`. This uses the existing host-submitted `copy_`
-transport, preserving packed/NZ expert bytes and quantization attributes. The
-native MXFP4 transport can still decorate it with its existing ND-to-NZ
-conversion. No MemFabric sparse-copy fallback is selected by this new path.
+Select `h2d_backend="torch"` for the host transfer transport. Shared NZ
+graph replay submits the prepared DMA copies through the native dispatcher.
 Set `cpu_moe.max_num_tokens` to cover every captured decode/verification batch;
 an oversized hybrid graph raises rather than entering legacy callback paging.
 Eager batches above that capacity retain ordinary paging.
+
+### Shared NZ CPU weights
+
+Use vLLM 0.30.0 and build kt-kernel from
+[cpu_moe_compute at db0d796](https://github.com/yxk-fdu/cpu_moe_compute/tree/db0d79674096e4a883f1e2e5687baf441acb9ab1/cpu_moe).
+Set `cpu_moe.weight_format="nz_mxfp4"`, `native_dispatch=true`, and
+`threadpool_count=1`. Place the host DMA buffers and compute pool on the
+same NUMA node. Leave `cpu_moe.weight_path` empty.
+
+The offload manager converts expert weights and scales during model loading
+and owns those buffers. It passes the four finalized fields to kt-kernel's
+`NZMOE`. Native registration verifies that the CPU backend and DMA use the
+same addresses. Graph replay submits CPU work and weight DMA through C++ and
+signals each completion on its own stream.
 
 ## Per-layer execution
 
@@ -106,7 +118,8 @@ pytest -q tests/ut/expert_offload/test_host_hybrid_transfer.py \
   tests/ut/expert_offload/test_lrc_policy.py \
   tests/ut/expert_offload/test_hybrid_executor.py \
   tests/ut/expert_offload/test_cpu_moe_wiring.py \
-  tests/ut/expert_offload/test_native_mxfp4_backend.py \
+  tests/ut/expert_offload/test_nz_mxfp4_backend.py \
+  tests/ut/expert_offload/test_shared_nz_owner.py \
   tests/ut/expert_offload/cpu_backend/test_async_completion_handoff.py
 ```
 

@@ -203,10 +203,9 @@ def attach_host_transfers(manager):
     if manager.ep_size != 1 or manager.enable_multi_card:
         raise ValueError("Host hybrid DMA currently requires single-card execution")
     from .h2d_transfer import TorchCopyH2DTransport
-    from .native_mxfp4_h2d import NativeMXFP4H2DTransport
 
     transport = manager._get_h2d_transport()
-    base = transport.base if isinstance(transport, NativeMXFP4H2DTransport) else transport
+    base = transport
     if not isinstance(base, TorchCopyH2DTransport):
         raise ValueError("Host hybrid DMA requires h2d_backend=torch")
     manager._host_weight_worker = HostWeightWorker(manager)

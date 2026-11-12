@@ -175,7 +175,7 @@ class DeviceExpertTransfer:
 
     def __init__(self, manager, layer, *, initialize_policy=True):
         from vllm_ascend.expert_offload.expert_offload_manager import _expert_weight
-        if manager.native_mxfp4_enabled or manager.ep_size != 1:
+        if manager.ep_size != 1:
             raise ValueError("Preconverted NZ transfer requires GGUF and EP size one")
         self.manager, self.layer = manager, layer
         self.layer_idx = manager.moe_layers.index(layer)

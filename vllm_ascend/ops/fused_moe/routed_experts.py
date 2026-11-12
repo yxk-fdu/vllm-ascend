@@ -528,16 +528,15 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         mgr.init_layer_cpu_buffers(self, self.offload_layer_idx)
         from vllm_ascend.expert_offload.cpu_backend.wiring import attach_or_defer_cpu_expert_backend
 
-        if not mgr.native_mxfp4_enabled:
-            attach_or_defer_cpu_expert_backend(
-                mgr,
-                routed_experts=self,
-                layer_name=self.layer_name,
-                moe_config=self.moe_config,
-                cpu_moe_config=cfg.cpu_moe,
-                enable_multi_card=self.enable_multi_card,
-                tp_size=get_current_vllm_config().parallel_config.tensor_parallel_size,
-            )
+        attach_or_defer_cpu_expert_backend(
+            mgr,
+            routed_experts=self,
+            layer_name=self.layer_name,
+            moe_config=self.moe_config,
+            cpu_moe_config=cfg.cpu_moe,
+            enable_multi_card=self.enable_multi_card,
+            tp_size=get_current_vllm_config().parallel_config.tensor_parallel_size,
+        )
 
     def _wrap_weight_loader_for_offload(self):
         """Wrap weight_loader to intercept w13/w2 weights and store them on CPU.

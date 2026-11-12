@@ -30,7 +30,6 @@ from vllm_ascend.expert_offload.h2d_transfer import (
     create_h2d_transport,
 )
 from vllm_ascend.expert_offload.lrc_policy import CppLRCExpertCachePolicy, LRCExpertCachePolicy
-from vllm_ascend.expert_offload.native_mxfp4_h2d import NativeExpertUploadTask, NativeMXFP4H2DTransport
 from vllm_ascend.ops.fused_moe.experts_selector import (
     commit_expert_substitutions,
     maybe_prune_topk_experts,
@@ -62,6 +61,58 @@ def _stable_float_checksum(values, scale: int = 1_000_000) -> int:
     """Deterministic fixed-point checksum for cross-rank debug comparison."""
     flat = values.reshape(-1).tolist() if hasattr(values, "reshape") else values
     return sum((index + 1) * round(float(value) * scale) for index, value in enumerate(flat))
+
+
+def _trim_startup_host_allocator(stage):
+    """Cold-start only: return unused glibc heap pages, never live tensors."""
+    if os.environ.get("CPU_MOE_STARTUP_TRIM") != "1":
+        return
+    import gc
+    def rss_kib():
+        with open("/proc/self/status") as handle:
+            return next(int(line.split()[1]) for line in handle if line.startswith("VmRSS:"))
+    gc.collect()
+    before = rss_kib()
+    libc = ctypes.CDLL("libc.so.6")
+    libc.malloc_trim.argtypes = [ctypes.c_size_t]
+    libc.malloc_trim.restype = ctypes.c_int
+    result = libc.malloc_trim(0)
+    logger.info("[STARTUP-HOST-TRIM] stage=%s result=%d rss_before_kib=%d rss_after_kib=%d", stage, result, before, rss_kib())
+
+
+def _prefill_scale_copy_views(source, destination):
+    """Use raw bytes only for identical dense physical scale layouts."""
+    if not isinstance(source, torch.Tensor) or not isinstance(destination, torch.Tensor):
+        return source, destination
+    shape = source.shape
+    strides = source.stride()
+    if (source.dtype != destination.dtype or shape != destination.shape
+            or strides != destination.stride()):
+        return source, destination
+    # The layouts match, so a single stride check covers both tensors.
+    # Walk non-singleton dimensions in physical order. Any gap or overlap
+    # makes a raw byte copy unsafe.
+    if source.numel() == 0:
+        return source, destination
+    extent = 1
+    for stride, length in sorted(zip(strides, shape)):
+        if length == 1:
+            continue
+        if stride != extent:
+            return source, destination
+        extent *= length
+
+    itemsize = source.element_size()
+    size = extent * itemsize
+    src_start = source.storage_offset() * itemsize
+    dst_start = destination.storage_offset() * itemsize
+    src_storage = source.untyped_storage()
+    dst_storage = destination.untyped_storage()
+    if (src_start + size > src_storage.nbytes()
+            or dst_start + size > dst_storage.nbytes()):
+        return source, destination
+    return (src_storage[src_start:src_start + size],
+            dst_storage[dst_start:dst_start + size])
 
 
 def _expert_weight(layer, name: str):
@@ -134,15 +185,6 @@ class ExpertOffloadManager:
                 # ablation compares across prefetch on/off runs.
                 logger.warning("[BENCH-ROUTE-STATS] expert_prefetch_enabled=True: hit rates are effective (include prefetch-migrated experts)")
         cpu_config = self.offload_config.cpu_moe
-        self._native_shared_weights = cpu_config.enabled and cpu_config.weight_format == "native_mxfp4"
-        self._native_owners = {}
-        self._native_loaded = {}
-        self._native_tp_size = vllm_config.parallel_config.tensor_parallel_size
-        if self._native_shared_weights and (
-            self.offload_config.enable_multi_card
-            or self._native_tp_size != 1 or cpu_config.threadpool_count != 1
-        ):
-            raise ValueError("Shared native MXFP4 requires single-card offload and one NUMA pool")
         # The minimum capacity is the conservative global dispatch threshold;
         # actual weight and placement sizes are resolved per MoE layer.
         self.num_device_experts = min(self.offload_config.num_device_experts_list)
@@ -467,167 +509,12 @@ class ExpertOffloadManager:
         """
         return self.offload_config.num_device_experts_for_layer(layer_idx)
 
-    @property
-    def native_mxfp4_enabled(self) -> bool:
-        return getattr(self, "_native_shared_weights", False)
 
-    def _init_native_layer_buffers(self, layer, layer_idx, experts):
-        # Optional KT dependency: only native CPU/NPU workers import this owner.
-        from kt_kernel.utils.native_mxfp4 import NativeMXFP4Weights
 
-        if self.ep_size != 1:
-            raise ValueError("Shared native MXFP4 requires EP size one")
-        # shard_per_rank defaults true even on one card; that shard is the
-        # complete expert set and remains compatible with shared native storage.
-        self._shard_base = 0
-        self._shard_size = experts
-        w13 = _expert_weight(layer, "w13_weight")
-        w2 = _expert_weight(layer, "w2_weight")
-        if w13.dtype != torch.uint8 or w2.dtype != torch.uint8 or w13.ndim != 3 or w2.ndim != 3:
-            raise ValueError("Shared native storage requires unpacked uint8 MXFP4 expert parameters")
-        hidden, intermediate = int(w13.shape[2]) * 2, int(w2.shape[2]) * 2
-        if w13.shape[1] != 2 * intermediate or w2.shape[1] != hidden:
-            raise ValueError("Unsupported native MXFP4 expert weight shapes")
-        if not hasattr(layer, "w13_weight_scale") or not hasattr(layer, "w2_weight_scale"):
-            raise ValueError("Native MXFP4 requires both E8M0 weight scales")
-        # Allocate once through the selected pinned-host allocator. These six
-        # buffers become the only routed-expert DRAM weight/scale owner.
-        shapes = (
-            (experts, intermediate, hidden // 2),
-            (experts, intermediate, hidden // 2),
-            (experts, hidden, intermediate // 2),
-            (experts, intermediate, hidden // 32),
-            (experts, intermediate, hidden // 32),
-            (experts, hidden, intermediate // 32),
-        )
-        nodes = self.offload_config.cpu_moe.numa_nodes
-        node = nodes[0] if nodes else 0
-        previous_affinity = os.sched_getaffinity(0)
-        with open(f"/sys/devices/system/node/node{node}/cpulist", encoding="utf-8") as cpu_file:
-            cpu_list = cpu_file.read().strip()
-        allowed = set()
-        for part in cpu_list.split(","):
-            bounds = part.split("-")
-            allowed.update(range(int(bounds[0]), int(bounds[-1]) + 1))
-        allowed &= previous_affinity
-        if not allowed:
-            raise ValueError(f"Native MXFP4 NUMA node {node} has no permitted CPUs")
-        os.sched_setaffinity(0, allowed)
-        try:
-            buffers = [self._allocate_expert_host_tensor(shape, torch.uint8) for shape in shapes]
-            for buffer in buffers:
-                ctypes.memset(buffer.data_ptr(), 0, buffer.numel())
-            owner = NativeMXFP4Weights(*buffers).validate(experts, hidden, intermediate)
-        finally:
-            os.sched_setaffinity(0, previous_affinity)
-        self._native_owners[layer_idx] = owner
-        self._native_loaded[layer_idx] = set()
-        # Compatibility views for expert-count bookkeeping. Native transfers
-        # never interpret the gate view as combined w13 storage.
-        self.w13_weights_cpu.append(list(owner.gate.unbind(0)))
-        self.w2_weights_cpu.append(list(owner.down.unbind(0)))
-        self.scale_cpu_buffers.setdefault("w13_weight_scale", []).append(list(owner.gate_scale.unbind(0)))
-        self.scale_cpu_buffers.setdefault("w2_weight_scale", []).append(list(owner.down_scale.unbind(0)))
-        self.w13_expert_size_bytes = owner.gate[0].numel() + owner.up[0].numel()
-        self.w2_expert_size_bytes = owner.down[0].numel()
 
-    def _require_native_weights_loaded(self):
-        for layer_idx, owner in self._native_owners.items():
-            expected = {
-                (expert, projection, kind)
-                for expert in range(owner.gate.shape[0])
-                for projection in ("w1", "w3", "w2")
-                for kind in ("weight", "scale")
-            }
-            missing = expected - self._native_loaded[layer_idx]
-            if missing:
-                raise RuntimeError(f"Native MXFP4 layer {layer_idx} has unloaded expert fields: {sorted(missing)[:8]}")
 
-    def _attach_native_cpu_backends(self):
-        from vllm_ascend.expert_offload.cpu_backend.wiring import maybe_attach_cpu_expert_backend
 
-        self._require_native_weights_loaded()
-        borrowed_layers = 0
-        for layer_idx, layer in enumerate(self.moe_layers):
-            backend = maybe_attach_cpu_expert_backend(
-                routed_experts=layer,
-                layer_name=layer.layer_name,
-                moe_config=layer.moe_config,
-                cpu_moe_config=self.offload_config.cpu_moe,
-                enable_multi_card=self.enable_multi_card,
-                tp_size=self._native_tp_size,
-                native_weights=self._native_owners[layer_idx],
-            )
-            if backend is not None:
-                owner = self._native_owners[layer_idx]
-                pointers = [tensor.data_ptr() for tensor in owner.tensors]
-                if backend._wrapper.native_weights is not owner or backend._wrapper.moe.native_weight_pointers() != pointers:
-                    raise RuntimeError("Native CPU backend is not borrowing the manager's weight storage")
-                borrowed_layers += 1
-        if os.environ.get("CPU_MOE_NUMA_AUDIT") == "1":
-            # Read-only NUMA page-location query after loading all six owners.
-            # Some driver-pinned allocations do not support Linux move_pages;
-            # retain negative statuses instead of assuming their placement.
-            from collections import Counter
-            addresses = []
-            page_size = os.sysconf("SC_PAGE_SIZE")
-            for owner in self._native_owners.values():
-                for tensor in owner.tensors:
-                    size = tensor.numel() * tensor.element_size()
-                    addresses.extend((tensor.data_ptr() + offset) & ~(page_size - 1)
-                                     for offset in (0, size // 2, size - 1))
-            try:
-                lib = ctypes.CDLL("libnuma.so.1", use_errno=True)
-                query = lib.numa_move_pages
-                query.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.POINTER(ctypes.c_void_p),
-                                  ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.c_int]
-                query.restype = ctypes.c_long
-                pages = (ctypes.c_void_p * len(addresses))(*addresses)
-                status = (ctypes.c_int * len(addresses))(*([-999] * len(addresses)))
-                rc = query(0, len(addresses), pages, None, status, 0)
-                logger.info("[NATIVE-NUMA-AUDIT] samples=%d rc=%d errno=%d page_nodes_or_errors=%s",
-                            len(addresses), rc, ctypes.get_errno(), dict(Counter(status)))
-            except Exception as error:
-                logger.info("[NATIVE-NUMA-AUDIT] unavailable: %s", error)
-        logger.info(
-            "[NATIVE-SHARED] layers=%d cpu_borrowed_layers=%d expert_weight_scale_gib=%.3f "
-            "persistent_host_format=native_mxfp4 cpu_weight_copies=0 host_nz_copies=0",
-            len(self._native_owners), borrowed_layers,
-            sum(owner.nbytes for owner in self._native_owners.values()) / (1024**3),
-        )
 
-    @staticmethod
-    def _copy_native_field(target, owned):
-        source = owned.view(torch.uint8)
-        if tuple(source.shape) != tuple(target.shape):
-            raise ValueError(f"Native MXFP4 checkpoint field shape mismatch: {source.shape} != {target.shape}")
-        target.copy_(source)
-
-    def _load_native_field(self, layer_idx, expert, projection, kind, loaded):
-        owner = self._native_owners[layer_idx]
-        field = {"w1": "gate", "w3": "up", "w2": "down"}[projection]
-        if kind == "scale":
-            field += "_scale"
-        target = getattr(owner, field)[expert]
-        # The mmap can close before background loading finishes. Keep only a
-        # bounded transient clone, using the existing load-pool drain policy.
-        owned = loaded.cpu().clone()
-        future = self._get_load_pool().submit(self._copy_native_field, target, owned)
-        self._track_load_future(future)
-        self._native_loaded[layer_idx].add((expert, projection, kind))
-
-    def _native_upload_task(self, layer_idx, source_eid, w13, w2, scale13, scale2, destination_eid, name):
-        owner = self._native_owners[layer_idx]
-        size13 = w13.untyped_storage().nbytes() // w13.shape[0]
-        size2 = w2.untyped_storage().nbytes() // w2.shape[0]
-        start13, start2 = destination_eid * size13, destination_eid * size2
-        return NativeExpertUploadTask(
-            owner=owner, expert=source_eid,
-            w13_destination=w13.untyped_storage()[start13:start13 + size13],
-            w2_destination=w2.untyped_storage()[start2:start2 + size2],
-            scale13_destination=scale13[destination_eid],
-            scale2_destination=scale2[destination_eid], name=name,
-        )
 
     def init_layer_cpu_buffers(self, layer, layer_moe_idx: int):
         """Allocate CPU weight + scale/offset buffers for one MoE layer.
@@ -642,12 +529,6 @@ class ExpertOffloadManager:
             f"MoE layers must have same expert count: {ntotal} vs {self.num_total_experts}"
         )
 
-        if self.native_mxfp4_enabled:
-            self._init_native_layer_buffers(layer, layer_moe_idx, ntotal)
-            self.moe_layers.append(layer)
-            self._extend_cache_for_layer()
-            self._register_layer_gate(layer)
-            return
 
         _w13 = _expert_weight(layer, "w13_weight")
         _w2 = _expert_weight(layer, "w2_weight")
@@ -789,9 +670,6 @@ class ExpertOffloadManager:
                 self.scale_bias_cpu_buffers,
             )
         )
-        if self.native_mxfp4_enabled:
-            weights_bytes = self._cpu_tensor_storage_bytes([owner.tensors[:3] for owner in self._native_owners.values()])
-            quant_bytes = self._cpu_tensor_storage_bytes([owner.tensors[3:] for owner in self._native_owners.values()])
         expert_bytes = weights_bytes + quant_bytes
         rss, hwm, available = self._host_memory_snapshot()
         cpu_mode = "sharded" if self.offload_config.shard_per_rank else "replicated"
@@ -853,7 +731,7 @@ class ExpertOffloadManager:
                 dtype = torch.uint8
                 target_layout = apply_mxfp4_weight_scale_layout(dev_tensor[0].view(torch.uint8))
                 per_expert_shape = tuple(target_layout.shape)
-                if self.ep_size == 1:
+                if self.ep_size == 1 and os.environ.get("CPU_MOE_SPLIT_SCALE") != "1":
                     # Load directly into the final device strides. The logical
                     # view still supports prefill/legacy Tensor copies, while
                     # decode can copy these same bytes without a second slab.
@@ -886,16 +764,17 @@ class ExpertOffloadManager:
         # Barrier: ensure all deferred load_w13/load_w2/_load_scale_shard
         # copies have landed before process_weights_after_loading reads them.
         self.drain_load_pool()
-        if self.native_mxfp4_enabled:
-            self._attach_native_cpu_backends()
         t0 = time.perf_counter()
         logger.info(
             "[OFFLOAD] weight load (safetensors→CPU buffer): %.1fs over %d calls",
             self._weight_load_secs,
             self._weight_load_calls,
         )
+        _trim_startup_host_allocator("after_weight_load")
         t1 = time.perf_counter()
         self.process_weights_after_loading()
+        self._nz_cpu_layout_ready = True
+        _trim_startup_host_allocator("after_weight_layout")
         self._publish_shared_h2d_sources()
         t2 = time.perf_counter()
 
@@ -1161,6 +1040,9 @@ class ExpertOffloadManager:
         Touch it only via untyped_storage() slicing, never through the tensor
         view. No-op for non-quantized (other dtype) models.
         """
+        if (self.offload_config.cpu_moe.weight_format == "nz_mxfp4"
+                and getattr(self, "_cpu_weights_finalized", False)):
+            raise RuntimeError("Retire the NZ CPU backend before replacing shared weight storage")
         prepared = getattr(self, "_prepared_expert_h2d", {})
         if any(getattr(plan, "native_dma_live", False) for plan in prepared.values()):
             raise RuntimeError("Close native DMA before reformatting expert buffers")
@@ -1170,12 +1052,6 @@ class ExpertOffloadManager:
             # source or destination storage can be replaced.
             torch.npu.synchronize()
             prepared.clear()
-        if self.native_mxfp4_enabled:
-            self._require_native_weights_loaded()
-            # Keep native bytes/scales on the host. Only device slot metadata
-            # is prepared here; every actual miss converts in HBM.
-            self._cast_device_slots_to_mxfp4_nz()
-            return
 
         first_w13 = self.w13_weights_cpu[0][0]
         first_layer = self.moe_layers[0]
@@ -1214,6 +1090,59 @@ class ExpertOffloadManager:
             self._cast_device_slots_to_mxfp4_nz()
         # else: non-quantized model, no-op
 
+    def _cast_device_slots_to_mxfp4_nz(self):
+        """Stamp on-device W4A8_MXFP expert weight slots with format-29 (NZ).
+
+        The device slot is already transposed by process_weights (offload
+        branch). Mirror the non-offload cast-then-transpose — and the CPU
+        relayout in _cast_cpu_weights_to_device_format — by transposing back
+        to the original shape, casting 29, then transposing forward again, so
+        the slot's format-29 layout is transpose(cast(original)). That is the
+        form npu_grouped_matmul's NZ kernel accepts for fp4_e2m1: it infers
+        transposeWeight from the layout (EZ1001 if base format, EZ0026 if the
+        cast landed on the transposed shape). Slot bytes are refreshed by
+        decode/prefill H2D at runtime (CPU buffer holds the matching NZ bytes);
+        this call fixes the format + layout metadata.
+
+        Fallback: some NPU devices/drivers only allow base format
+        (allow_internal_format=False) and reject the format-29 cast at the ACL
+        layer (device error 361001). This call only stamps format *metadata* on
+        the resident slots — the bytes themselves are refreshed by decode/prefill
+        H2D at runtime, and the fused-swiglu GMM path (DeepSeek-V4) reads them
+        via raw storage, so skipping it is safe for V4. The SiTU raw
+        npu_grouped_matmul path (Kimi-K3) checks the format and would reject
+        fp4_e2m1 on base format (EZ1001); such models are unsupported on these
+        devices. On the first cast failure we warn once and return, leaving the
+        slots in base format. w.data is reassigned only after a successful cast,
+        so a raised exception never leaves a slot half-mutated.
+        """
+        for layer in self.moe_layers:
+            for name in ("w13_weight", "w2_weight"):
+                w = _expert_weight(layer, name)
+                if w is None:
+                    continue
+                d = w.data.transpose(1, 2).contiguous()
+                try:
+                    d = torch_npu.npu_format_cast(
+                        d.view(torch.uint8),
+                        29,
+                        customize_dtype=torch.float8_e4m3fn,
+                        input_dtype=torch_npu.float4_e2m1fn_x2,
+                    )
+                except RuntimeError as e:
+                    logger.warning(
+                        "[OFFLOAD] npu_format_cast to format-29 (mxfp4 NZ) "
+                        "failed on layer slot %r; leaving expert slots in base "
+                        "format. Safe for DeepSeek-V4 (fused-swiglu GMM reads "
+                        "raw storage); breaks the Kimi-K3 SiTU "
+                        "npu_grouped_matmul path. Error: %s",
+                        name,
+                        e,
+                    )
+                    return
+                w.data = d.transpose(1, 2)
+
+
     def _cast_cpu_weights_to_device_format(self, mxfp4: bool = False, w4a8_dynamic: bool = False):
         """Relayout resident CPU w13/w2 expert buffers into the device format.
 
@@ -1229,7 +1158,24 @@ class ExpertOffloadManager:
         num_moe_layers = len(self.w13_weights_cpu)
         num_experts = len(self.w13_weights_cpu[0])
         use_shard = self.offload_config.shard_per_rank
+        verify_nz = mxfp4 and self.offload_config.cpu_moe.weight_format == "nz_mxfp4"
+        if verify_nz:
+            self._nz_cpu_layout_verified = set()
         for layer_id in range(num_moe_layers):
+            samples = []
+            if verify_nz:
+                # Validate PHYSICAL source bytes, not NPU view metadata. V4's
+                # fused kernel can expose a base-format view of NZ storage.
+                for buffers in (self.w13_weights_cpu, self.w2_weights_cpu):
+                    for eid in sorted({0, num_experts - 1}):
+                        tensor = buffers[layer_id][eid]
+                        packed_k, rows = tensor.shape
+                        groups = packed_k // 16
+                        for row in sorted({0, rows // 2, rows - 1}):
+                            for group in sorted({0, groups // 2, groups - 1}):
+                                for byte in (0, 7, 15):
+                                    offset = (group * rows + row) * 16 + byte
+                                    samples.append((tensor, offset, int(tensor[group * 16 + byte, row])))
             w13 = torch.stack(self.w13_weights_cpu[layer_id]).to("npu")
             w2 = torch.stack(self.w2_weights_cpu[layer_id]).to("npu")
             if mxfp4:
@@ -1285,59 +1231,13 @@ class ExpertOffloadManager:
                     w2_storage[local_i * per_w2 : (local_i + 1) * per_w2]
                 )
 
-    def _cast_device_slots_to_mxfp4_nz(self):
-        """Stamp on-device W4A8_MXFP expert weight slots with format-29 (NZ).
 
-        The device slot is already transposed by process_weights (offload
-        branch). Mirror the non-offload cast-then-transpose — and the CPU
-        relayout in _cast_cpu_weights_to_device_format — by transposing back
-        to the original shape, casting 29, then transposing forward again, so
-        the slot's format-29 layout is transpose(cast(original)). That is the
-        form npu_grouped_matmul's NZ kernel accepts for fp4_e2m1: it infers
-        transposeWeight from the layout (EZ1001 if base format, EZ0026 if the
-        cast landed on the transposed shape). Slot bytes are refreshed by
-        decode/prefill H2D at runtime (CPU buffer holds the matching NZ bytes);
-        this call fixes the format + layout metadata.
-
-        Fallback: some NPU devices/drivers only allow base format
-        (allow_internal_format=False) and reject the format-29 cast at the ACL
-        layer (device error 361001). This call only stamps format *metadata* on
-        the resident slots — the bytes themselves are refreshed by decode/prefill
-        H2D at runtime, and the fused-swiglu GMM path (DeepSeek-V4) reads them
-        via raw storage, so skipping it is safe for V4. The SiTU raw
-        npu_grouped_matmul path (Kimi-K3) checks the format and would reject
-        fp4_e2m1 on base format (EZ1001); such models are unsupported on these
-        devices. On the first cast failure we warn once and return, leaving the
-        slots in base format. w.data is reassigned only after a successful cast,
-        so a raised exception never leaves a slot half-mutated.
-        """
-        for layer in self.moe_layers:
-            for name in ("w13_weight", "w2_weight"):
-                w = _expert_weight(layer, name)
-                if w is None:
-                    continue
-                if self.native_mxfp4_enabled and torch_npu.get_npu_format(w) == 29:
-                    continue
-                d = w.data.transpose(1, 2).contiguous()
-                try:
-                    d = torch_npu.npu_format_cast(
-                        d.view(torch.uint8),
-                        29,
-                        customize_dtype=torch.float8_e4m3fn,
-                        input_dtype=torch_npu.float4_e2m1fn_x2,
-                    )
-                except RuntimeError as e:
-                    logger.warning(
-                        "[OFFLOAD] npu_format_cast to format-29 (mxfp4 NZ) "
-                        "failed on layer slot %r; leaving expert slots in base "
-                        "format. Safe for DeepSeek-V4 (fused-swiglu GMM reads "
-                        "raw storage); breaks the Kimi-K3 SiTU "
-                        "npu_grouped_matmul path. Error: %s",
-                        name,
-                        e,
-                    )
-                    return
-                w.data = d.transpose(1, 2)
+            if verify_nz:
+                for tensor, offset, expected in samples:
+                    actual = tensor.untyped_storage()[tensor.storage_offset() + offset]
+                    if actual != expected:
+                        raise RuntimeError(f"NZ physical layout verification failed on layer {layer_id}")
+                self._nz_cpu_layout_verified.add(layer_id)
 
     def _process_scale_bias_cpu_buffers(self):
         """Apply update_bias transformation to scale_bias CPU buffers.
@@ -1597,9 +1497,6 @@ class ExpertOffloadManager:
         """Store w1/w3 shard to CPU buffer (transposed) via the load pool."""
         self._assert_native_dma_reload_safe(layer_moe_idx)
         self._weight_load_calls += 1
-        if self.native_mxfp4_enabled:
-            self._load_native_field(layer_moe_idx, expert_id, shard_id, "weight", loaded_weight)
-            return
         idx = self._shard_local(expert_id)
         if idx is None:
             return  # shard-per-rank: expert not owned by this rank
@@ -1618,9 +1515,6 @@ class ExpertOffloadManager:
         """Store w2 weight to CPU buffer (transposed) via the load pool."""
         self._assert_native_dma_reload_safe(layer_moe_idx)
         self._weight_load_calls += 1
-        if self.native_mxfp4_enabled:
-            self._load_native_field(layer_moe_idx, expert_id, "w2", "weight", loaded_weight)
-            return
         idx = self._shard_local(expert_id)
         if idx is None:
             return  # shard-per-rank: expert not owned by this rank
@@ -1645,11 +1539,6 @@ class ExpertOffloadManager:
         """
         self._assert_native_dma_reload_safe(layer_moe_idx)
         self._weight_load_calls += 1
-        if self.native_mxfp4_enabled:
-            if attr_name not in ("w13_weight_scale", "w2_weight_scale"):
-                raise ValueError(f"Unsupported native MXFP4 quantization attribute {attr_name}")
-            self._load_native_field(layer_moe_idx, expert_id, shard_id, "scale", loaded_weight)
-            return
         assert shard_id in ("w1", "w2", "w3"), f"unexpected shard_id: {shard_id}"
         if "scale_bias" in attr_name:
             target_dict = self.scale_bias_cpu_buffers
@@ -1834,12 +1723,6 @@ class ExpertOffloadManager:
         destination_eid: int,
     ) -> list[H2DCopyTask]:
         """Build weight and quant tasks for one prefill-pool expert."""
-        if self.native_mxfp4_enabled:
-            return [self._native_upload_task(
-                layer_idx, source_eid, self._prefill_w13[pool_slot], self._prefill_w2[pool_slot],
-                self._prefill_w13_scale[pool_slot], self._prefill_w2_scale[pool_slot],
-                destination_eid, f"native-prefill[L{layer_idx},E{source_eid}->P{pool_slot}:E{destination_eid}]",
-            )]
         w13_start = destination_eid * self.w13_expert_size_bytes
         w2_start = destination_eid * self.w2_expert_size_bytes
         w13_dst = self._prefill_w13[pool_slot].untyped_storage()[w13_start : w13_start + self.w13_expert_size_bytes]
@@ -1883,6 +1766,8 @@ class ExpertOffloadManager:
             else:
                 source = self._shared_h2d_source(layer_idx, source_eid, attr_name)
                 nbytes = dst.numel() * dst.element_size()
+            if attr_name in ("w13_weight_scale", "w2_weight_scale"):
+                source, dst = _prefill_scale_copy_views(source, dst)
             tasks.append(
                 H2DCopyTask(
                     source=source,
@@ -1943,6 +1828,8 @@ class ExpertOffloadManager:
         relies on it staying with 32-expert mapping.  Prefill path in
         apply() explicitly uses self._prefill_log2phy instead.
         """
+        _diag = os.environ.get("CPU_MOE_PREFILL_TIMING") == "1"
+        _t0 = time.perf_counter() if _diag else 0
         ndl = self.num_device_layers
         pool_slot = layer_idx % ndl
         ntotal = self.num_total_experts
@@ -1980,6 +1867,7 @@ class ExpertOffloadManager:
             residency = log2phy.detach().to("cpu", non_blocking=False)
             self._prefill_residency_host[layer_idx] = residency
 
+        _t1 = time.perf_counter() if _diag else 0
         if owner_hit:
             # Same model layer re-loaded into the same pool slot: expert
             # weights are immutable, so every pool expert is already in
@@ -1992,6 +1880,7 @@ class ExpertOffloadManager:
             return
 
         tasks, n_h2d, n_d2d, n_skip = self._build_prefill_load_tasks(layer_idx, pool_slot, residency)
+        _t2 = time.perf_counter() if _diag else 0
         # Split the batch by direction: the resident-expert D2D copies
         # (decode slots -> pool) go to a side stream and overlap the
         # pinned H2D copies on the load stream.  The two sets write
@@ -2012,12 +1901,18 @@ class ExpertOffloadManager:
                 self._get_h2d_transport().copy_batch(d2d_tasks)
                 d2d_evt = torch_npu.npu.Event()
                 self._prefill_d2d_stream.record_event(d2d_evt)
+        _t3 = time.perf_counter() if _diag else 0
         with torch_npu.npu.stream(self.load_stream):
             if d2d_evt is not None:
                 self.load_stream.wait_event(d2d_evt)
             self._get_h2d_transport().copy_batch(h2d_tasks)
+            _t4 = time.perf_counter() if _diag else 0
             self._refresh_prefill_fp32_scale(pool_slot, ntotal)
+            _t5 = time.perf_counter() if _diag else 0
             self._synchronize_h2d()
+            _t6 = time.perf_counter() if _diag else 0
+        if _diag:
+            logger.info("[PREFILL-TIMING] layer=%d h2d=%d d2d=%d skip=%d residency_ms=%.3f build_ms=%.3f d2d_submit_ms=%.3f h2d_submit_ms=%.3f scale_ms=%.3f sync_ms=%.3f total_ms=%.3f", layer_idx, n_h2d, n_d2d, n_skip, 1000*(_t1-_t0), 1000*(_t2-_t1), 1000*(_t3-_t2), 1000*(_t4-_t3), 1000*(_t5-_t4), 1000*(_t6-_t5), 1000*(_t6-_t0))
         self._prefill_pool_owner[pool_slot] = layer_idx
 
         if self._debug:
@@ -3093,8 +2988,6 @@ class ExpertOffloadManager:
         shard-per-rank: eid is GLOBAL; remap to this rank's local shard slot.
         Otherwise: the expert tensor's own (already pinned) storage, global eid.
         """
-        if self.native_mxfp4_enabled:
-            raise RuntimeError("Native MXFP4 sources must use the shared owner and native upload tasks")
         cpu_buf = getattr(self, f"{which}_weights_cpu")[layer_idx]
         if self.offload_config.shard_per_rank:
             local_eid = self._shard_local(eid)
@@ -3112,8 +3005,6 @@ class ExpertOffloadManager:
         shard-per-rank: eid is GLOBAL; remap to this rank's local shard slot.
         Otherwise: the expert tensor's own storage, global eid.
         """
-        if self.native_mxfp4_enabled:
-            raise RuntimeError("Native MXFP4 sources must use the shared owner and native upload tasks")
         cpu_buf = getattr(self, f"{which}_weights_cpu")[layer_idx]
         if self.offload_config.shard_per_rank:
             return cpu_buf[eid - self._shard_base].untyped_storage()
@@ -3604,8 +3495,6 @@ class ExpertOffloadManager:
             self.h2d_transport = TorchCopyH2DTransport()
         elif self.h2d_transport is None:
             self.h2d_transport = self._create_h2d_transport()
-        if self.native_mxfp4_enabled and not isinstance(self.h2d_transport, NativeMXFP4H2DTransport):
-            self.h2d_transport = NativeMXFP4H2DTransport(self.h2d_transport)
         return self.h2d_transport
 
     def _allocate_expert_host_tensor(self, shape, dtype) -> torch.Tensor:
@@ -3743,7 +3632,7 @@ class ExpertOffloadManager:
         """Build stable decode views after final format conversion, not per job."""
         # A single-rank shard contains every expert; it is the default on 153.
         # Only true multi-rank sharding needs the peer/local fallback path.
-        if self.native_mxfp4_enabled or (self.offload_config.shard_per_rank and self.ep_size != 1):
+        if self.offload_config.shard_per_rank and self.ep_size != 1:
             return
         from .prepared_h2d import PreparedH2DUnsupportedLayout, PreparedLayerH2D
 
@@ -3769,12 +3658,6 @@ class ExpertOffloadManager:
             if prepared.layer is not layer:
                 raise RuntimeError("Prepared H2D layer changed; drain and rebuild descriptors")
             return prepared.tasks(eid, slot)
-        if self.native_mxfp4_enabled:
-            return [self._native_upload_task(
-                layer_idx, eid, _expert_weight(layer, "w13_weight"), _expert_weight(layer, "w2_weight"),
-                layer.w13_weight_scale, layer.w2_weight_scale, slot,
-                f"native-decode[L{layer_idx},E{eid}->S{slot}]",
-            )]
         w13_start = slot * self.w13_expert_size_bytes
         w2_start = slot * self.w2_expert_size_bytes
         w13_dst = self._cached_expert_h2d_view(
@@ -4567,7 +4450,6 @@ class ExpertOffloadManager:
             and getattr(cpu, "transfer_policy", "") == "load_balance"
             and getattr(cpu, "weight_format", "") == "gguf"
             and self.ep_size == 1
-            and not self.native_mxfp4_enabled
         )
 
     def trigger_next_layer_prefetch(self, layer, hidden_states: torch.Tensor | None = None) -> None:

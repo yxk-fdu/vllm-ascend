@@ -281,7 +281,7 @@ def unsupported_reason(manager, layer) -> str | None:
         return "requires exactly one prefetched expert"
     if config.enable_multi_card or manager.ep_size != 1:
         return "requires single card"
-    if not cpu.enabled or cpu.weight_format != "gguf" or manager.native_mxfp4_enabled:
+    if not cpu.enabled or cpu.weight_format not in ("gguf", "nz_mxfp4"):
         return "requires the GGUF hybrid CPU backend"
     if cpu.transfer_scheduler != "npu" or cpu.transfer_policy != "load_balance":
         return "requires the existing NPU load-balance source/copy setup"

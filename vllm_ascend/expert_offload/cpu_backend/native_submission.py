@@ -84,6 +84,14 @@ class NativePollWorker:
             weights[slot].data_ptr(), inputs[slot].data_ptr(), outputs[slot].data_ptr(), False)
         # Owners remain alive until graphs have retired and native threads joined.
         dma_layer = self._register_dma_layer(context.transfer)
+        if backend.config.weight_format == "nz_mxfp4":
+            manager = context.transfer.worker.manager
+            plan = self._dma_layers[(id(manager), context.transfer.layer_idx)][1]
+            sources, _, _, _, _ = plan.native_dma_table()
+            fields = {field[3]: source for field, source in zip(plan.fields, sources)}
+            expected = [fields[name] for name in ("w13", "w2", "w13_weight_scale", "w2_weight_scale")]
+            if wrapper.moe.weight_pointers() != expected:
+                raise RuntimeError("NZ CPU and native DMA must read the exact same source bytes")
         index = len(self.channels)
         self.channels.append((backend, hidden, ready, hostflag, context, task))
         native = self.engine.add(

@@ -40,7 +40,7 @@ if any(isinstance(n,ast.FunctionDef) and n.name=='_prepare_expert_h2d_layer' for
 methods=[n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name in names];assert len(methods)==len(names)
 env['logger']=logging.getLogger('h2d-regression')
 env['torch_npu']=NS(get_npu_format=lambda _: (_ for _ in ()).throw(AssertionError('NPU queried')))
-definitions(D/'expert_offload_manager.py',{'_expert_weight'},env)
+definitions(D/'expert_offload_manager.py',{'_expert_weight','_prefill_scale_copy_views'},env)
 proxy=ast.ClassDef(name='Manager',bases=[],keywords=[],body=methods,decorator_list=[])
 exec(compile(ast.fix_missing_locations(ast.Module(body=[proxy],type_ignores=[])),str(D/'expert_offload_manager.py'),'exec'),env)
 Manager=env['Manager'];Transport=env['TorchCopyH2DTransport']
@@ -64,7 +64,7 @@ class Layer:
 
 class Fixture:
  def __init__(self,slots=2,strided=False,cast=False):
-  m=self.manager=Manager();m.native_mxfp4_enabled=False;m.offload_config=NS(shard_per_rank=False);m.num_total_experts=3;m.ep_size=1
+  m=self.manager=Manager();m.offload_config=NS(shard_per_rank=False,cpu_moe=NS(weight_format='gguf'));m.num_total_experts=3;m.ep_size=1
   m._allocate_expert_host_tensor=lambda shape,dtype:real_torch.empty(shape,dtype=dtype)
   m.w13_expert_size_bytes=8;m.w2_expert_size_bytes=4;m._shard_local=lambda e:e
   m.w13_weights_cpu=[[real_torch.full((8,),11+e,dtype=real_torch.uint8) for e in range(3)]]
@@ -166,14 +166,16 @@ class Tests(unittest.TestCase):
   f=Fixture(strided=True);f.prepare();m=f.manager;self.assertIn(0,m._prepared_expert_h2d)
   for value in (7,19):
    m.scale_cpu_buffers['scale'][0][1].fill_(value);f.prepare();m.h2d_transport.copy_batch(m._build_expert_h2d_tasks(f.layer,0,1,0));self.assertTrue(real_torch.all(f.layer.scale[0]==value))
- def test_cold_reformat_drains_before_replacing_storage(self):
-  f=Fixture();f.prepare();m=f.manager;m.native_mxfp4_enabled=True;torch.npu.events=[]
-  m._require_native_weights_loaded=lambda:torch.npu.events.append('weights-ready');m._cast_device_slots_to_mxfp4_nz=lambda:torch.npu.events.append('cast')
-  m._synchronize_h2d=lambda:torch.npu.events.append('wrong-load-stream-only-sync')
-  m.process_weights_after_loading();self.assertEqual(torch.npu.events,['device-sync','weights-ready','cast']);self.assertEqual(m._prepared_expert_h2d,{})
- def test_native_and_sharded_paths_do_not_build_plain_cache(self):
-  for native,shard in ((True,False),(False,True)):
-   f=Fixture();f.manager.native_mxfp4_enabled=native;f.manager.ep_size=2;f.manager.offload_config.shard_per_rank=shard;f.manager._prepare_expert_h2d_layer(f.layer,0);self.assertFalse(getattr(f.manager,'_prepared_expert_h2d',{}))
+ def test_reformat_rejects_live_shared_nz_owner(self):
+  f=Fixture();f.prepare();m=f.manager;torch.npu.events=[]
+  m.offload_config.cpu_moe.weight_format='nz_mxfp4';m._cpu_weights_finalized=True
+  with self.assertRaisesRegex(RuntimeError,'Retire the NZ CPU backend'):
+   m.process_weights_after_loading()
+  self.assertEqual(torch.npu.events,[]);self.assertIn(0,m._prepared_expert_h2d)
+ def test_sharded_path_does_not_build_plain_cache(self):
+  f=Fixture();m=f.manager;m.ep_size=2;m.offload_config.shard_per_rank=True
+  m._prepare_expert_h2d_layer(f.layer,0)
+  self.assertFalse(getattr(m,'_prepared_expert_h2d',{}))
 
  def test_single_rank_default_shard_uses_prepared_storage(self):
   f=Fixture(cast=True);m=f.manager;m.offload_config.shard_per_rank=True;f.prepare()

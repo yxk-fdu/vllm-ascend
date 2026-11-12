@@ -104,7 +104,7 @@ def maybe_attach_cpu_expert_backend(
         max_num_tokens=cpu_moe_config.max_num_tokens,
         numa_nodes=cpu_moe_config.numa_nodes,
     )
-    if config.weight_format == "native_mxfp4":
+    if config.weight_format == "nz_mxfp4":
         if native_weights is None:
             raise RuntimeError("Native CPU backend must borrow the offload manager's loaded weight owner")
         backend = KtKernelCPUExpertBackend(config, native_weights=native_weights)
@@ -127,8 +127,8 @@ def attach_or_defer_cpu_expert_backend(manager, **kwargs):
     immediately. Execution ownership and kernel math are unchanged.
     """
     cpu = kwargs["cpu_moe_config"]
-    if (cpu.enabled and cpu.weight_format == "gguf"
-            and getattr(cpu, "host_weight_numa_node", None) is not None
+    if (cpu.enabled and (cpu.weight_format == "nz_mxfp4" or (
+            cpu.weight_format == "gguf" and getattr(cpu, "host_weight_numa_node", None) is not None))
             and not getattr(manager, "_cpu_weights_finalized", False)):
         pending = getattr(manager, "_pending_cpu_backend_attachments", None)
         if pending is None:
@@ -144,6 +144,17 @@ def finalize_deferred_cpu_backends(manager):
     manager._cpu_weights_finalized = True
     pending = getattr(manager, "_pending_cpu_backend_attachments", [])
     for kwargs in pending:
+        if kwargs["cpu_moe_config"].weight_format == "nz_mxfp4":
+            if not getattr(manager, "_nz_cpu_layout_ready", False):
+                raise RuntimeError("NZ CPU cannot attach before physical weight conversion")
+            from kt_kernel.utils.nz_mxfp4 import NZWeights
+            layer_idx = manager.moe_layers.index(kwargs["routed_experts"])
+            if layer_idx not in getattr(manager, "_nz_cpu_layout_verified", set()):
+                raise RuntimeError("NZ CPU requires verified physical NZ source bytes")
+            kwargs["native_weights"] = NZWeights(
+                tuple(manager.w13_weights_cpu[layer_idx]), tuple(manager.w2_weights_cpu[layer_idx]),
+                tuple(manager.scale_cpu_buffers["w13_weight_scale"][layer_idx]),
+                tuple(manager.scale_cpu_buffers["w2_weight_scale"][layer_idx]))
         maybe_attach_cpu_expert_backend(**kwargs)
     count = len(pending)
     pending.clear()

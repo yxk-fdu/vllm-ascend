@@ -275,8 +275,7 @@ def create_manager_dispatcher(manager, *, library_path: str):
     cpu = config.cpu_moe
     if (not config.expert_prefetch_enabled or config.enable_multi_card or manager.ep_size != 1
             or getattr(config, "expert_predictor", "fate") != "fate"
-            or not cpu.enabled or cpu.backend != "kt_kernel" or cpu.weight_format != "gguf"
-            or manager.native_mxfp4_enabled
+            or not cpu.enabled or cpu.backend != "kt_kernel" or cpu.weight_format not in ("gguf", "nz_mxfp4")
             or platform.machine().lower() not in ("x86_64", "amd64")
             or not Path(library_path).is_file()):
         return None

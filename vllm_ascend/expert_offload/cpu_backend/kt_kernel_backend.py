@@ -87,9 +87,9 @@ class KtKernelBackendConfig:
     weight_format: str = "gguf"
 
     def __post_init__(self) -> None:
-        if self.weight_format not in ("gguf", "native_mxfp4"):
-            raise ValueError("weight_format must be gguf or native_mxfp4")
-        if self.weight_format == "native_mxfp4" and self.threadpool_count != 1:
+        if self.weight_format not in ("gguf", "nz_mxfp4"):
+            raise ValueError("weight_format must be gguf or nz_mxfp4")
+        if self.weight_format == "nz_mxfp4" and self.threadpool_count != 1:
             raise ValueError("Native MXFP4 currently requires one NUMA pool")
         positive_fields = {
             "num_experts": self.num_experts,
@@ -121,10 +121,7 @@ class KtKernelBackendConfig:
         except (IndexError, KeyError, ValueError) as exc:
             raise ValueError(
                 "weight_path must be literal or use the {layer_idx} field") from exc
-        if self.weight_format == "native_mxfp4":
-            if not (Path(path) / "model.safetensors.index.json").is_file():
-                raise FileNotFoundError(f"Native MXFP4 checkpoint index not found: {path}")
-        elif not Path(path).is_file():
+        if self.weight_format != "nz_mxfp4" and not Path(path).is_file():
             raise FileNotFoundError(f"CPU MoE GGUF not found: {path}")
         return path
 
@@ -342,16 +339,11 @@ def _current_stream_handle(device: torch.device) -> int:
 
 
 def _default_wrapper_factory(weight_format="gguf", native_weights=None, **kwargs: Any) -> Any:
-    if weight_format == "native_mxfp4":
-        from kt_kernel.utils.llamafile import LlamafileMoEWrapper
-        from kt_kernel.utils.native_mxfp4 import NativeMXFP4Weights
+    if weight_format == "nz_mxfp4":
+        from kt_kernel.utils.nz_mxfp4 import NZMoEWrapper
         if native_weights is None:
-            nodes = kwargs.get("numa_nodes")
-            native_weights = NativeMXFP4Weights.from_checkpoint(
-                kwargs["weight_path"], kwargs["layer_idx"], kwargs["num_experts"],
-                kwargs["hidden_size"], kwargs["moe_intermediate_size"],
-                numa_node=nodes[0] if nodes else 0)
-        return LlamafileMoEWrapper(native_weights=native_weights, **kwargs)
+            raise RuntimeError("NZ CPU must borrow finalized DMA source owners")
+        return NZMoEWrapper(native_weights=native_weights, **kwargs)
     try:
         from kt_kernel import KTMoEWrapper
     except ImportError as exc:
@@ -394,10 +386,10 @@ class KtKernelCPUExpertBackend:
         self._graph_task_created_ns: int | None = None
 
         native_options = {}
-        if config.weight_format == "native_mxfp4":
+        if config.weight_format == "nz_mxfp4":
             native_options = {"weight_format": config.weight_format, "native_weights": native_weights}
         elif native_weights is not None:
-            raise ValueError("native_weights requires weight_format=native_mxfp4")
+            raise ValueError("native_weights requires weight_format=nz_mxfp4")
         self._wrapper = wrapper_factory(
             **native_options,
             layer_idx=config.layer_idx,
