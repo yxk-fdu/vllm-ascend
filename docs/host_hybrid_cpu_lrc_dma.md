@@ -20,11 +20,10 @@ Its existing hotness, protected-expert and deterministic victim ordering are
 retained. Host hybrid admission uses this implementation when the cache policy
 is enabled; ordinary non-hybrid paging keeps its original Python policy.
 
-Graph execution requires the existing coherent-x86 sequence-poll runtime:
-set `KT_MOE_POLL_LIBRARY` to the installed library exposing `register_flag` and
-`poll_next` (optionally `start_poll` and `stop_poll`). Configure it **before**
-backend creation. `KT_MOE_POLL_SUBMIT` is no longer the graph dispatch switch:
-graph CPU submission always polls. There is no host-callback fallback.
+Graph CPU submission polls an ordered D2H sequence. With
+`cpu_moe.native_dispatch=true` shared NZ starts the C++ dispatcher with the CPU backend.
+The older x86 Python dispatcher uses `KT_MOE_POLL_LIBRARY` to load its
+`register_flag` and `poll_next` implementation before backend creation.
 The installed kt-kernel must expose pinned input/output buffers and the existing
 completion runtime. Mapped combine and value-based `ExternalEvent` support
 remain required.
@@ -43,8 +42,10 @@ Set `cpu_moe.weight_format="nz_mxfp4"`, `native_dispatch=true`, and
 `threadpool_count=1`. Place the host DMA buffers and compute pool on the
 same NUMA node. Leave `cpu_moe.weight_path` empty.
 Set `KT_MOE_MATCH_NPU_MXFP8=1` before loading the backend. The graph dispatcher
-also needs `KT_MOE_POLL_LIBRARY` set before backend creation, as described above.
-This native graph path currently requires an x86 host.
+uses the CPU backend's native ABI directly. The ARM shared NZ path was
+verified on Ascend 950DT with CANN 9.2.1. On ARM, graph results are written
+into a 64 KiB-aligned, ACL-registered host buffer that the NPU reads directly.
+ARM eager execution uses the existing non-blocking result H2D merge.
 
 The offload manager converts expert weights and scales during model loading
 and owns those buffers. It passes the four finalized fields to kt-kernel's

@@ -22,6 +22,7 @@ from vllm_ascend.expert_offload.cpu_prefetch_diagnostics import Phase as CpuPref
 from dataclasses import dataclass
 import json
 import os
+import platform
 import threading
 import time
 from pathlib import Path
@@ -224,6 +225,9 @@ class _KtKernelExpertTask:
         self._backend = backend
         self._hidden_states = hidden_states
         self._stream_handle = stream_handle
+        self.host_mapped_result = not (
+            platform.machine() == "aarch64" and backend.config.weight_format == "nz_mxfp4"
+        )
         self._result: torch.Tensor | None = None
         self._error: BaseException | None = None
         self._finished = False
@@ -421,7 +425,7 @@ class KtKernelCPUExpertBackend:
         # CPU side -- the mask never gated weight loading.
         self._wrapper.load_weights(None)
         self._host_transfer = None
-        if os.environ.get("KT_MOE_POLL_LIBRARY"):
+        if (config.native_dispatch and config.weight_format == "nz_mxfp4") or os.environ.get("KT_MOE_POLL_LIBRARY"):
             from . import poll_submission
             poll_submission.prepare(self)
 
@@ -544,8 +548,8 @@ class KtKernelCPUExpertBackend:
         """
         self._require_graph_methods()
         if not hasattr(self, "_poll_sequence_slots"):
-            raise RuntimeError("Graph CPU MoE requires KT_MOE_POLL_LIBRARY before backend initialization; "
-                               "host callback dispatch has been retired")
+            raise RuntimeError("Graph CPU MoE requires native_dispatch or KT_MOE_POLL_LIBRARY "
+                               "before backend initialization")
         self._pin_graph_batch_size(hidden_states)
 
         import torch_npu
@@ -575,14 +579,15 @@ class KtKernelCPUExpertBackend:
             # D2H：把 hidden states、专家 ID 和权重拷到 CPU 缓冲区。
             self._wrapper.copy_inputs_to_cpu_buffers(hidden_states, topk_ids,
                                                      topk_weights)
-            result = self._wrapper.get_forward_output_buffers(hidden_states)[0]
             from . import poll_submission
             # Sequence publication follows EVERY input/mapping copy. The CPU
             # planner masks pinned routes and queues DMA before compute submit;
             # neither the input producer nor submit worker waits for that DMA.
-            poll_submission.record_submission(
+            result = poll_submission.record_submission(
                 self, hidden_states, cpu_stream, output_ready,
                 before_submit=context.prepare if context is not None else None)
+            if result is None:
+                result = self._wrapper.get_forward_output_buffers(hidden_states)[0]
             # Join the captured submission branch for graph validity. CPU
             # completion only signals readiness; the compute-stream combine
             # kernel reads the mapped host result directly.

@@ -2,10 +2,11 @@
 """Submit graph CPU MoE from an ordered D2H sequence, without ACL callbacks.
 
 The int32 sequence is copied after all input copies on the same stream.
-Only supported on coherent x86 host memory; pinned slots remain alive for the
-engine lifetime. A missed sequence aborts rather than using stale inputs.
+Pinned slots remain alive for the engine lifetime. A missed sequence aborts
+rather than using stale inputs.
 """
 import atexit,ctypes,json,logging,os,threading,time
+import platform
 from functools import partial
 import torch
 from . import async_completion
@@ -106,6 +107,10 @@ class PollWorker:
 
 def prepare(backend):
     global _WORKER
+    if platform.machine() == "aarch64" and not (
+        backend.config.native_dispatch and backend.config.weight_format == "nz_mxfp4"
+    ):
+        raise RuntimeError("ARM graph CPU MoE requires shared NZ and native dispatch")
     # Initialize outside graph capture; captured graphs only increment and copy.
     device=torch.npu.current_device()
     backend._poll_sequence_device=torch.zeros((64,16),device=torch.device('npu',device),dtype=torch.int32)
@@ -125,6 +130,7 @@ def record_submission(backend,hidden,stream,ready,before_submit=None):
     if slot>=64:raise RuntimeError('CPU input poll graph slot limit reached')
     backend._poll_sequence_used+=1
     deviceflag,hostflag=backend._poll_sequence_slots[slot]
-    _WORKER.register(backend,hidden,stream,ready,hostflag,before_submit)
+    result = _WORKER.register(backend,hidden,stream,ready,hostflag,before_submit)
     deviceflag.add_(1)
     hostflag.copy_(deviceflag,non_blocking=True)
+    return result

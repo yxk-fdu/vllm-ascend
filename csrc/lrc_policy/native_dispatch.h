@@ -455,8 +455,8 @@ class NativeCpuDispatcher {
   }
  public:
   NativeCpuDispatcher(py::capsule api, uintptr_t stream, uintptr_t weight_stream, int poll_cpu, int completion_cpu) : stream_(stream), weight_stream_(weight_stream) {
-#if !defined(__x86_64__)
-    throw std::runtime_error("Native NPU-to-CPU dispatch currently requires coherent x86 host memory");
+#if !defined(__x86_64__) && !defined(__aarch64__)
+    throw std::runtime_error("Native NPU-to-CPU dispatch requires x86-64 or AArch64");
 #endif
     api_ = static_cast<const KtDispatchApi*>(api.get_pointer());
     if (!api_ || api_->version != 1 || !api_->submit || !api_->sync || !api_->begin || !api_->context || !api_->mark)

@@ -4,6 +4,7 @@ import atexit
 import json
 import logging
 import os
+import platform
 import threading
 import time
 from pathlib import Path
@@ -21,6 +22,7 @@ class NativePollWorker:
         from _vllm_ascend_lrc import NativeCpuDispatcher
 
         self.device = device
+        self._arm_host = platform.machine() == "aarch64"
         self.stream = torch_npu.npu.SyncLaunchStream(device=device)
         self.weight_stream = torch_npu.npu.SyncLaunchStream(device=device)
         self.engine = NativeCpuDispatcher(
@@ -79,9 +81,13 @@ class NativePollWorker:
         slot = wrapper.layer_idx % KExpertsCPUBuffer.buffer_depth
         if weights[slot].dtype != torch.float32 or not ids[slot].is_contiguous() or not context.mapping.is_contiguous():
             raise ValueError("Native dispatch requires contiguous IDs/mapping and float32 route weights")
+        result = outputs[slot]
+        if self._arm_host:
+            from .mapped_combine import arm_graph_result
+            result = arm_graph_result(self.device, result.shape, slot)
         task = wrapper.moe.forward_task(
             batches[slot].data_ptr(), ids[slot].size(-1), ids[slot].data_ptr(),
-            weights[slot].data_ptr(), inputs[slot].data_ptr(), outputs[slot].data_ptr(), False)
+            weights[slot].data_ptr(), inputs[slot].data_ptr(), result.data_ptr(), False)
         # Owners remain alive until graphs have retired and native threads joined.
         dma_layer = self._register_dma_layer(context.transfer)
         if backend.config.weight_format == "nz_mxfp4":
@@ -104,6 +110,7 @@ class NativePollWorker:
         self.engine.bind_dma_channel(index, dma_layer, context.transfer.layer.log2phy.data_ptr(),
                                      context.mapping.numel() * context.mapping.element_size())
         context.native_channel = index
+        return result
 
     def register_prefetch(self, site, cap):
         dma_layer = self._register_dma_layer(site.transfer)

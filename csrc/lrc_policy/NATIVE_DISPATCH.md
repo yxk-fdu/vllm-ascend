@@ -94,8 +94,11 @@ remains independent of those libraries. Build it in the same Python/Torch NPU
 environment as the service. Third-party kt-kernel sources and binaries are not
 vendor-copied here: its versioned API exports above remain a prerequisite.
 
-This implementation requires Linux, coherent x86 pinned host memory, the
+This implementation requires Linux, coherent pinned host input memory, the
 value-based Torch NPU external-event API and the matching kt-kernel build.
+The shared NZ graph path on AArch64 uses an aligned ACL-registered host
+result buffer for direct AIV reads. It was validated on Ascend 950DT with
+CANN 9.2.1.
 With a cache policy enabled, use C++ LRC. Admission state is shared between
 eager execution and all captured shapes, and protected by a state mutex.
 
