@@ -37,7 +37,8 @@ Eager batches above that capacity retain ordinary paging.
 ### Shared NZ CPU weights
 
 Use vLLM 0.30.0 and build kt-kernel from
-[cpu_moe_compute at db0d796](https://github.com/yxk-fdu/cpu_moe_compute/tree/db0d79674096e4a883f1e2e5687baf441acb9ab1/cpu_moe).
+[cpu_moe_compute at 599e66a](https://github.com/yxk-fdu/cpu_moe_compute/tree/599e66a4f3155f21e02b2a924bd8a372430cabd7/cpu_moe).
+This revision includes the AArch64 build fix for the packaged ready-poll helper.
 Set `cpu_moe.weight_format="nz_mxfp4"`, `native_dispatch=true`, and
 `threadpool_count=1`. Place the host DMA buffers and compute pool on the
 same NUMA node. Leave `cpu_moe.weight_path` empty.
