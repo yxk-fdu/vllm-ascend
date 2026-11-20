@@ -45,8 +45,8 @@ from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, maybe_trans_nz
 
 
-def _prepare_expert_offload_before_super(layer_name, moe_config, quant_config, expert_map_manager):
-    """Apply the fork pre-super offload capacity contract."""
+def _prepare_expert_offload_before_super(layer_name, moe_config, quant_config, expert_map_manager) -> int | None:
+    """Apply pre-super offload capacity and return the allocated slot count."""
     cfg = get_ascend_config().expert_offload_config
     if (moe_config is None or expert_map_manager is None
             or not cfg.expert_offload or quant_config is None
@@ -79,6 +79,7 @@ def _prepare_expert_offload_before_super(layer_name, moe_config, quant_config, e
         "[EXPERT-OFFLOAD] pre-super allocation: layer=%s logical_experts=%d device_slots=%d",
         layer_name, total, slots,
     )
+    return slots
 
 
 class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
@@ -421,15 +422,16 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
     ):
         object.__setattr__(self, "tid2eid", tid2eid)
         if len(args) >= 3:
-            _prepare_expert_offload_before_super(
+            offload_capacity = _prepare_expert_offload_before_super(
                 args[0], args[2], args[3] if len(args) > 3 else kwargs.get("quant_config"),
                 args[4] if len(args) > 4 else kwargs.get("expert_map_manager"),
             )
         else:
-            _prepare_expert_offload_before_super(
+            offload_capacity = _prepare_expert_offload_before_super(
                 kwargs.get("layer_name", ""), kwargs.get("moe_config"),
                 kwargs.get("quant_config"), kwargs.get("expert_map_manager"),
             )
+        object.__setattr__(self, "_offload_preallocated_capacity", offload_capacity)
         super().__init__(*args, **kwargs)
         if self.quant_config is None:
             # Preserve the pre-refactor BF16 lifecycle: let upstream create
@@ -650,6 +652,19 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         self.moe_instance_id = AscendRoutedExperts.moe_counter
 
         eplb_config = get_ascend_config().eplb_config
+        offload_capacity = getattr(self, "_offload_preallocated_capacity", None)
+        if offload_capacity is not None and (
+            self.moe_config.ep_size != 1
+            or eplb_config.dynamic_eplb
+            or eplb_config.expert_map_path
+            or self.mix_placement
+            or eplb_config.num_redundant_experts
+            or self.moe_config.num_experts != self.moe_config.num_logical_experts
+        ):
+            raise ValueError(
+                "Preallocated expert offload requires single-card static placement "
+                "without redundant experts, an EPLB expert map, or mixed shared experts."
+            )
 
         # The upstream FusedMoEFactory factory has already included redundant expert
         # slots in moe_config and allocated RoutedExperts weights accordingly.
@@ -686,6 +701,10 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         expected_local_num_experts = (
             placement_moe_config.num_experts + self.global_redundant_expert_num
         ) // self.moe_config.ep_size
+        if offload_capacity is not None:
+            # Offload retains every logical expert on the host but allocates
+            # only resident NPU slots. _init_expert_offload builds log2phy next.
+            expected_local_num_experts = offload_capacity
         if local_num_experts != expected_local_num_experts:
             raise ValueError(
                 "EPLB local expert capacity mismatch: "

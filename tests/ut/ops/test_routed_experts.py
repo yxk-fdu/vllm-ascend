@@ -28,6 +28,7 @@ def test_offload_capacity_is_applied_before_parent_init(monkeypatch, positional)
         pass
 
     def parent_init(self, layer_name, params_dtype, moe_config, quant_config, expert_map_manager):
+        assert self._offload_preallocated_capacity == 84
         assert moe_config.num_local_experts == expert_map_manager._local_num_experts == 84
         assert torch.equal(expert_map_manager._expert_map[:84], torch.arange(84, dtype=torch.int32))
         assert torch.all(expert_map_manager._expert_map[84:] == -1)
@@ -182,3 +183,72 @@ def test_update_expert_map_preserves_upstream_and_legacy_contracts(monkeypatch):
 
     assert routed_experts.ascend_expert_map is legacy_map
     assert expert_map_manager._expert_map is legacy_map
+
+
+@pytest.fixture
+def eplb_capacity_layer(monkeypatch):
+    eplb_config = SimpleNamespace(
+        dynamic_eplb=False, expert_map_path=None, num_redundant_experts=0,
+        eplb_policy_type=0, expert_heat_collection_interval=1,
+    )
+    monkeypatch.setattr(
+        routed_experts_module, "get_ascend_config",
+        lambda: SimpleNamespace(eplb_config=eplb_config),
+    )
+    monkeypatch.setattr(
+        routed_experts_module, "get_current_vllm_config",
+        lambda: SimpleNamespace(parallel_config=SimpleNamespace(tensor_parallel_size=1)),
+    )
+    monkeypatch.setattr(torch.Tensor, "npu", lambda tensor, *args, **kwargs: tensor)
+    monkeypatch.setattr(AscendRoutedExperts, "_promote_attr_to_buffer", lambda *args: None)
+    monkeypatch.setattr(routed_experts_module.VllmEplbAdaptor, "register_layer", lambda *args: None)
+    layer = AscendRoutedExperts.__new__(AscendRoutedExperts)
+    layer.moe_config = SimpleNamespace(
+        num_experts=256, num_logical_experts=256, num_local_experts=256, ep_size=1,
+    )
+    layer.mix_placement = False
+    return layer, eplb_config
+
+
+def test_eplb_accepts_preallocated_offload_slots(eplb_capacity_layer):
+    layer, _ = eplb_capacity_layer
+    layer._offload_preallocated_capacity = 84
+    layer.moe_config.num_local_experts = 84
+    layer.init_eplb(0)
+    assert layer.moe_config.num_logical_experts == layer.moe_config.num_experts == 256
+    assert layer.moe_config.num_local_experts == 84
+    assert layer.moe_load.shape == (84,)
+    assert layer.log2phy is None  # _init_expert_offload builds the resident map next.
+    assert not layer.dynamic_eplb
+
+
+@pytest.mark.parametrize(("allocated", "capacity"), [(84, None), (83, 84)])
+def test_eplb_still_rejects_unexpected_local_capacity(eplb_capacity_layer, allocated, capacity):
+    layer, _ = eplb_capacity_layer
+    layer._offload_preallocated_capacity = capacity
+    layer.moe_config.num_local_experts = allocated
+    with pytest.raises(ValueError, match="local expert capacity mismatch"):
+        layer.init_eplb(0)
+
+
+def test_eplb_preserves_full_resident_layer_validation(eplb_capacity_layer):
+    layer, _ = eplb_capacity_layer
+    layer.init_eplb(0)
+    assert layer.moe_load.shape == (256,)
+
+
+@pytest.mark.parametrize("unsupported", ["dynamic_eplb", "mix_placement", "redundancy", "expert_map"])
+def test_preallocated_offload_rejects_incompatible_eplb(eplb_capacity_layer, unsupported):
+    layer, config = eplb_capacity_layer
+    layer._offload_preallocated_capacity = 84
+    layer.moe_config.num_local_experts = 84
+    if unsupported == "dynamic_eplb":
+        config.dynamic_eplb = True
+    elif unsupported == "mix_placement":
+        layer.mix_placement = True
+    elif unsupported == "redundancy":
+        layer.moe_config.num_experts += 1
+    else:
+        config.expert_map_path = "placement.json"
+    with pytest.raises(ValueError, match="Preallocated expert offload requires"):
+        layer.init_eplb(0)
