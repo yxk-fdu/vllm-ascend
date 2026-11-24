@@ -184,9 +184,7 @@ def apply_offloaded_experts(layer, hidden_states, topk_weights, topk_ids, router
         prefill_regime = False
     elif native_transfer is not None:
         site = native_transfer.submit(topk_weights, topk_ids)
-        if mgr.offload_config.expert_prefetch_enabled and (
-            bool(_EXTRA_CTX.capturing) or torch.npu.is_current_stream_capturing()
-        ):
+        if mgr.offload_config.expert_prefetch_enabled:
             from vllm_ascend.expert_offload.native_prefetch import prefetch_after_demand
 
             prefetch_after_demand(mgr, layer, hidden_states, site)

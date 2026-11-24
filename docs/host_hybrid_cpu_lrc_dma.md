@@ -55,8 +55,8 @@ export PYTHONPATH="$PWD/csrc/lrc_policy${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
 Use `h2d_backend="torch"` and FATE, with route substitution and pruning
-disabled. Captured prefetch work queues behind current-layer demand. In eager
-mode it is submitted after the current demand-ready event. A batch whose
+disabled. Both captured and eager prefetch work queue behind current-layer
+demand via the native channel dependency. A batch whose
 token count exceeds the single-card paging limit (`min(device_slots) // topk`)
 uses the eager full-layer pool. The option defaults to false.
 

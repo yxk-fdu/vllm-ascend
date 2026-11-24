@@ -358,7 +358,13 @@ class NativeCpuDispatcher {
             auto loads = c.planner->prepare_npu_demand(
                 c.ids, c.weights, c.mapping, c.tokens, c.topk, c.id_size, c.map_size);
             demand_calls_.fetch_add(1, std::memory_order_relaxed);
-            queue_weight(i, std::move(loads), 0);
+            if (loads.empty()) {
+              if (record_event_(reinterpret_cast<void*>(c.weight_ready), 1, 0,
+                                reinterpret_cast<void*>(weight_stream_)))
+                throw std::runtime_error("Native weight-ready record failed");
+            } else {
+              queue_weight(i, std::move(loads), 0);
+            }
             continue;
           }
           // The historical callback_enter marker now means native input observed.
