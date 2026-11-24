@@ -374,11 +374,13 @@ PYBIND11_MODULE(_vllm_ascend_lrc, m) {
            py::arg("lrc"), py::arg("scores"), py::arg("npu_fixed_cost") = 0,
            py::arg("cpu_extra_cost") = -1, py::keep_alive<1, 8>())
       .def("plan", &NativeHostPlanner::plan)
+      .def("plan_npu_demand", &NativeHostPlanner::plan_npu_demand)
+      .def("prepare_npu_demand", &NativeHostPlanner::prepare_npu_demand)
       .def("plan_prefetch", &NativeHostPlanner::plan_prefetch)
       .def("prepare_prefetch", &NativeHostPlanner::prepare_prefetch)
       .def("prepare", &NativeHostPlanner::prepare);
   py::class_<NativeCpuDispatcher>(m, "NativeCpuDispatcher")
-      .def(py::init<py::capsule, uintptr_t, uintptr_t, int, int>())
+      .def(py::init<py::object, uintptr_t, uintptr_t, int, int>())
       .def("configure_dma", &NativeCpuDispatcher::configure_dma)
       .def("add_dma_layer", &NativeCpuDispatcher::add_dma_layer)
       .def("bind_dma_channel", &NativeCpuDispatcher::bind_dma_channel)
@@ -386,6 +388,8 @@ PYBIND11_MODULE(_vllm_ascend_lrc, m) {
       .def("set_dma_capture", &NativeCpuDispatcher::set_dma_capture, py::call_guard<py::gil_scoped_release>())
       .def("dma_timings", &NativeCpuDispatcher::dma_timings)
       .def("add", &NativeCpuDispatcher::add)
+      .def("add_npu_demand", &NativeCpuDispatcher::add_npu_demand)
+      .def("demand_stats", &NativeCpuDispatcher::demand_stats)
       .def("add_prefetch", &NativeCpuDispatcher::add_prefetch)
       .def("add_prefetch_after", &NativeCpuDispatcher::add_prefetch_after)
       .def("prefetch_stats", &NativeCpuDispatcher::prefetch_stats)

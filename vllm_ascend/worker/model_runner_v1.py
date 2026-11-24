@@ -168,7 +168,7 @@ from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoa
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
 from vllm_ascend.expert_offload.decode_stats import get_decode_stats
-from vllm_ascend.expert_offload.graph_capacity import validate_graph_token_capacity
+from vllm_ascend.expert_offload.graph_capacity import needs_eager_expert_loading, validate_graph_token_capacity
 from vllm_ascend.expert_offload.benchmark_counters import get_route_counters
 from vllm_ascend.expert_offload.expert_offload_manager import (
     get_expert_offload_manager,
@@ -3763,6 +3763,18 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(num_tokens_padded, use_cascade_attn or has_encoder_output)
+        manager = getattr(self, "offload_manager", None)
+        if (
+            force_uniform_decode is None
+            and cudagraph_mode != CUDAGraphMode.NONE
+            and self.parallel_config.data_parallel_size == 1
+            and needs_eager_expert_loading(manager, batch_descriptor.num_tokens)
+        ):
+            # Oversized single-card batches use the eager full-layer pool.
+            # Capture still builds dummy graphs, but live dispatch must never
+            # replay one that skipped the Python full-layer load.
+            force_eager = True
+            cudagraph_mode, batch_descriptor = dispatch_cudagraph(num_tokens_padded)
         num_tokens_padded = batch_descriptor.num_tokens
         if enable_sp(self.vllm_config):
             assert batch_descriptor.num_tokens % self.vllm_config.parallel_config.tensor_parallel_size == 0, (

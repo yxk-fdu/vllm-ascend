@@ -116,6 +116,18 @@ def apply_offloaded_experts(layer, hidden_states, topk_weights, topk_ids, router
         routed_scaling_factor=getattr(router, "routed_scaling_factor", 1.0),
         is_hash_routed=layer.tid2eid is not None,
     )
+    native_transfer = None
+    if (
+        mgr._native_npu_dma_enabled
+        and not mgr._skip_prefill
+        and layer.log2phy is not None
+        and num_tokens * topk_ids.size(-1) <= mgr.num_device_experts_for_layer(layer.offload_layer_idx)
+        and num_tokens <= mgr.offload_threshold
+    ):
+        from vllm_ascend.expert_offload.native_prefetch import get_native_npu_transfer
+
+        native_transfer = get_native_npu_transfer(mgr, layer)
+        native_transfer.wait_for_prefetch()
     counters = getattr(mgr, "_benchmark_route_counters", None)
     counter_sample = None
     counter_layer = None
@@ -161,17 +173,25 @@ def apply_offloaded_experts(layer, hidden_states, topk_weights, topk_ids, router
                 # Join input publication, not demand weight completion. Prediction
                 # and D2H can now overlap current-layer H2D on the DMA stream.
                 torch.npu.current_stream().wait_event(published)
-                previous = getattr(mgr, "_prefetch_demand_context", None)
-                mgr._prefetch_demand_context = context
-                try:
-                    mgr.trigger_next_layer_prefetch(layer, hidden_states)
-                    prefetch_started_early = True
-                finally:
-                    mgr._prefetch_demand_context = previous
+                from vllm_ascend.expert_offload.native_prefetch import prefetch_after_demand
+
+                prefetch_after_demand(mgr, layer, hidden_states, context)
+                prefetch_started_early = True
             hybrid_plan = prepared.finish(before_weight_wait=prepare_prefetch)
     if hybrid_plan is not None:
         topk_ids = hybrid_plan.npu_topk_ids
         topk_weights = hybrid_plan.npu_topk_weights
+        prefill_regime = False
+    elif native_transfer is not None:
+        site = native_transfer.submit(topk_weights, topk_ids)
+        if mgr.offload_config.expert_prefetch_enabled and (
+            bool(_EXTRA_CTX.capturing) or torch.npu.is_current_stream_capturing()
+        ):
+            from vllm_ascend.expert_offload.native_prefetch import prefetch_after_demand
+
+            prefetch_after_demand(mgr, layer, hidden_states, site)
+            prefetch_started_early = True
+        site.ready.wait()
         prefill_regime = False
     elif layer.enable_multi_card:
         mgr.update_weights_multi_card(

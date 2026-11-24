@@ -43,7 +43,7 @@ def test_standard_prefetch_keeps_callback_and_weight_ready_order(capturing):
         "get_subscribed_compute_streams": lambda: [stream],
     }
     manager = SimpleNamespace(
-        _host_hybrid_enabled=False, _prefetch_stream=stream,
+        _host_hybrid_enabled=False, _native_npu_dma_enabled=False, _prefetch_stream=stream,
         _prefetch_state_lock=nullcontext(), _prefetch_layer_npu_event={}, enable_multi_card=False,
         _build_prefetch_call=lambda *args: (lambda _: steps.append("load"), None),
         _run_prefetch_callback=lambda fn, args: fn(args),
@@ -67,6 +67,15 @@ def test_report_thread_mutates_inference_tensor():
         executor.submit(callback(exits), manager, planner, mapping).result(timeout=5)
     assert mapping.tolist() == [-1, 0, 1]
     assert exits == failures == []
+
+
+def test_native_prefetch_dispatches_the_staged_site():
+    steps = []
+    manager = SimpleNamespace(_host_hybrid_enabled=False, _native_npu_dma_enabled=True)
+    site = SimpleNamespace(dispatch_prefetch=steps.append)
+    dispatch = load_manager_method("_dispatch_prefetch", {})
+    dispatch(manager, site, None)
+    assert steps == [manager]
 
 
 @pytest.mark.parametrize('error', [RuntimeError('partial copy'), SystemExit('callback failed')])

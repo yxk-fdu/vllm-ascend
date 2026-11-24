@@ -8,6 +8,16 @@ from copy import copy
 from vllm.config import CUDAGraphMode, VllmConfig
 
 
+def needs_eager_expert_loading(manager, moe_rows: int) -> bool:
+    """Oversized single-card NPU-only batches require the eager weight pool."""
+    return (
+        manager is not None
+        and not manager._host_hybrid_enabled
+        and not manager.enable_multi_card
+        and moe_rows > manager.offload_threshold
+    )
+
+
 def validate_graph_token_capacity(
     max_num_tokens: int, sizes: Iterable[int], *, stage: str, query_len: int, max_num_seqs: int
 ) -> None:

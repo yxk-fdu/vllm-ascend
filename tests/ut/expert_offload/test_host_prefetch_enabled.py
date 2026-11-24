@@ -30,6 +30,7 @@ def test_host_initialization_preserves_requested_prefetch(enabled):
         def __init__(self):
             self.config = {"expert_prefetch_enabled": enabled}
             self.cpu_moe = SimpleNamespace(enabled=True)
+            self.native_expert_dma = False
 
         @property
         def expert_prefetch_enabled(self):

@@ -67,3 +67,27 @@ def test_invalid_predictions_are_ignored_and_bad_mapping_rejected():
         p.plan_prefetch([[3]], [[1.]], [0, 0, 2, -1, -1, -1, -1, -1], 2)
     with pytest.raises(ValueError, match='cap'):
         p.plan_prefetch([[3]], [[1.]], mapping, 0)
+
+
+def test_npu_demand_loads_all_distinct_misses_despite_hybrid_limit():
+    state = policy()
+    p = native.NativeHostPlanner(8, 3, 1, 1, 20, 0, state, [0.0] * 8)
+    before = state.step(1)
+    demand = p.plan_npu_demand(
+        [[0, 3, 4], [3, -1, 7]],
+        [[0.2, 0.4, 0.4], [1.0, 0.0, 0.0]],
+        [0, 1, -1, -1, -1, -1, -1, -1],
+    )
+    assert demand.loads == [(2, 3), (1, 4)]
+    assert demand.mapping == [0, -1, -1, 2, 1, -1, -1, -1]
+    assert demand.cpu_ids == [[-1, -1, -1], [-1, -1, -1]]
+    assert state.step(1) == before + 1
+
+
+def test_npu_demand_rejects_overflow_before_observing_routes():
+    state = policy()
+    p = planner(state)
+    before = state.snapshot(1)
+    with pytest.raises(ValueError, match="resident expert slots"):
+        p.plan_npu_demand([[0, 1, 3, 4]], [[1.0] * 4], [0, 1, 2, -1, -1, -1, -1, -1])
+    assert state.snapshot(1) == before

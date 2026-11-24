@@ -25,7 +25,7 @@ The C++ implementation is adapted from
 [haodi19/vllm-ascend at 268b963c](https://github.com/haodi19/vllm-ascend/tree/268b963ca365b03fccd70d41e49ce4bca1e852fc/csrc/lrc_policy).
 Its existing hotness, protected-expert and deterministic victim ordering are
 retained. Host hybrid admission uses this implementation when the cache policy
-is enabled; ordinary non-hybrid paging keeps its original Python policy.
+is enabled. Native NPU-only paging also uses this policy when enabled.
 
 Graph CPU submission polls an ordered D2H sequence and starts the C++
 dispatcher with the CPU backend. The installed kt-kernel must expose the
@@ -40,6 +40,29 @@ worker checks the requested sizes before loading weights, including speculative
 decode alignment and the scheduler's sequence limit. MRV1 also validates the
 resolved target-model graph descriptors before capture. Eager batches above the
 CPU MoE capacity retain ordinary paging.
+
+### NPU-only decode with native DMA
+
+For a single A5 device with the V1 model runner and W4A8MXFP experts, set
+`expert_offload_config.native_expert_dma=true` and `cpu_moe.enabled=false`.
+This uses the same native planner and DMA queue as hybrid graph execution.
+All required misses go to the NPU. There is no kt-kernel runtime or CPU FFN
+completion event in this mode. Build the value-wait extension as well:
+
+```bash
+(cd csrc/lrc_policy && python setup_npu_wait.py build_ext --inplace)
+export PYTHONPATH="$PWD/csrc/lrc_policy${PYTHONPATH:+:$PYTHONPATH}"
+```
+
+Use `h2d_backend="torch"` and FATE, with route substitution and pruning
+disabled. Captured prefetch work queues behind current-layer demand. In eager
+mode it is submitted after the current demand-ready event. A batch whose
+token count exceeds the single-card paging limit (`min(device_slots) // topk`)
+uses the eager full-layer pool. The option defaults to false.
+
+`KT_MOE_POLL_CPU` and `cpu_moe.native_dispatch_dma_cpu` can pin the two
+threads. By default the runtime selects distinct CPUs from the process
+affinity. The dispatcher exposes separate demand and prefetch counters.
 
 ### CPU and NUMA affinity
 

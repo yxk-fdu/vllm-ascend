@@ -163,7 +163,18 @@ class ExpertOffloadManager:
         self.offload_config = get_ascend_config().expert_offload_config
         cpu = self.offload_config.cpu_moe
         self._host_hybrid_enabled = cpu.enabled
+        self._native_npu_dma_enabled = self.offload_config.native_expert_dma and not cpu.enabled
+        self._native_dma_worker = None
+        self._native_npu_transfers = {}
         self._host_weight_worker = None
+        if self._native_npu_dma_enabled:
+            from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+
+            parallel = vllm_config.parallel_config
+            if (parallel.world_size != 1 or parallel.data_parallel_size != 1
+                    or vllm_config.use_v2_model_runner
+                    or not get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE_MXFP)):
+                raise ValueError("native_expert_dma requires a single A5 device and the V1 model runner")
         # Honor the requested prefetch setting. Host demand admission joins
         # the target's prefetch event before reading residency or publishing
         # its input-ready flag; C++ LRC serializes shared policy accesses.
@@ -780,7 +791,9 @@ class ExpertOffloadManager:
             self.cache_calls = [0 for _ in range(num_moe_layers)]
             self.last_hit_experts = [[] for _ in range(num_moe_layers)]
             self.last_miss_experts = [[] for _ in range(num_moe_layers)]
-            policy_type = CppLRCExpertCachePolicy if self._host_hybrid_enabled else LRCExpertCachePolicy
+            policy_type = (CppLRCExpertCachePolicy
+                           if self._host_hybrid_enabled or self._native_npu_dma_enabled
+                           else LRCExpertCachePolicy)
             self.cache_policy = policy_type(
                 num_layers=num_moe_layers,
                 num_experts=self.num_total_experts,
@@ -3483,6 +3496,8 @@ class ExpertOffloadManager:
         if native_dma is not None:
             native_dma.close()
             self._native_dma_worker = None
+        self._native_npu_dma = None
+        getattr(self, "_native_npu_transfers", {}).clear()
         weight_worker = getattr(self, "_host_weight_worker", None)
         if weight_worker is not None:
             weight_worker.close()
@@ -4363,9 +4378,10 @@ class ExpertOffloadManager:
         staged = self._stage_predicted_topk(layer_idx, hidden_states, predicted=predicted)
         if staged is None:
             return
-
-        ready_to_load_event = torch_npu.npu.Event()
-        torch_npu.npu.current_stream().record_event(ready_to_load_event)
+        ready_to_load_event = None
+        if not (self._host_hybrid_enabled or self._native_npu_dma_enabled):
+            ready_to_load_event = torch_npu.npu.Event()
+            torch_npu.npu.current_stream().record_event(ready_to_load_event)
         self._dispatch_prefetch(staged, ready_to_load_event)
 
     def _run_prefetch_callback(self, prefetch_fn, args) -> None:
@@ -4392,11 +4408,10 @@ class ExpertOffloadManager:
         layer_delta=0 (same-stream FIFO already orders the callback), or the
         on-demand-done event for layer_delta=1.
 
-        `staged` is exactly _stage_predicted_topk's return tuple.
+        `staged` is the native site or legacy buffer tuple from _stage_predicted_topk.
         """
-        if self._host_hybrid_enabled:
-            from .native_prefetch import dispatch_native_prefetch
-            dispatch_native_prefetch(self, staged)
+        if self._host_hybrid_enabled or self._native_npu_dma_enabled:
+            staged.dispatch_prefetch(self)
             return
         (topk_ids_h, topk_weights_h, log2phy_h, log2phy_np, next_layer, next_idx, mc2_mask_h) = staged
         capturing = bool(_EXTRA_CTX.capturing)
@@ -4432,9 +4447,8 @@ class ExpertOffloadManager:
 
     def _stage_predicted_topk(self, layer_idx, hidden_states, predicted=None):
         """Resolve the next layer, predict its experts on-device, and D2H-stage
-        them into pinned buffers. Returns (topk_ids_h, topk_weights_h, log2phy_h,
-        log2phy_np, next_layer, next_idx), or None if prefetch isn't possible
-        (last layer / missing gate weights / prediction failed)."""
+        them into pinned buffers. Returns a native route site, a legacy
+        buffer tuple, or None if prefetch isn't possible."""
         next_idx = layer_idx + 1
         # TO BE CHECKED: was `>= len(self.moe_layers) - 1`, which excluded the LAST MoE
         # layer from being prefetched for.
@@ -4444,7 +4458,7 @@ class ExpertOffloadManager:
             predicted = self.predict_next_layer_experts_npu(layer_idx, hidden_states)
         if predicted is None:
             return None
-        if self._host_hybrid_enabled:
+        if self._host_hybrid_enabled or self._native_npu_dma_enabled:
             from .native_prefetch import stage_native_prefetch
             return stage_native_prefetch(self, next_idx, predicted, bool(_EXTRA_CTX.capturing))
         topk_weights, topk_ids = predicted

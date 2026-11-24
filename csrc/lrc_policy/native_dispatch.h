@@ -53,6 +53,18 @@ class NativeHostPlanner {
 
   NativePlan plan(std::vector<std::vector<Id>> ids,
                   std::vector<std::vector<double>> weights, std::vector<Id> mapping) {
+    return plan_demand(std::move(ids), std::move(weights), std::move(mapping), true);
+  }
+
+  NativePlan plan_npu_demand(std::vector<std::vector<Id>> ids,
+                             std::vector<std::vector<double>> weights, std::vector<Id> mapping) {
+    return plan_demand(std::move(ids), std::move(weights), std::move(mapping), false);
+  }
+
+ private:
+  NativePlan plan_demand(std::vector<std::vector<Id>> ids,
+                         std::vector<std::vector<double>> weights, std::vector<Id> mapping,
+                         bool cpu_compute) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (mapping.size() != size_t(experts_) || ids.size() != weights.size())
       throw std::invalid_argument("Host route/mapping shape mismatch");
@@ -75,6 +87,8 @@ class NativeHostPlanner {
         protected_ids.insert(e);
       }
     }
+    if (!cpu_compute && protected_ids.size() > size_t(slots_))
+      throw std::invalid_argument("NPU demand does not fit the resident expert slots");
     for (Id e = 0; e < experts_; ++e) scores_[e] = scores_[e] * 0.99 + counts[e];
     std::vector<Id> residents, cold, targets, missing;
     for (Id s = 0; s < slots_; ++s) if (owners[s] < 0) targets.push_back(s);
@@ -101,20 +115,24 @@ class NativeHostPlanner {
     const auto cpu_cost = [&](Id e) -> __int128 {
       return numerator_ + static_cast<__int128>(counts[e] - 1) * cpu_extra_cost_;
     };
-    __int128 remaining_cpu = 0;
-    for (Id e : missing) remaining_cpu += cpu_cost(e);
-    const Id copy_unit = denominator_ - numerator_;
-    __int128 best_cost = std::max(remaining_cpu, static_cast<__int128>(npu_fixed_cost_));
-    Id n = 0;
-    const Id limit = std::min<Id>({Id(missing.size()), Id(targets.size()), max_transfers_});
-    for (Id copied = 1; copied <= limit; ++copied) {
-      remaining_cpu -= cpu_cost(missing[copied - 1]);
-      __int128 copy_cost = static_cast<__int128>(copied) * copy_unit + npu_fixed_cost_;
-      __int128 cost = std::max(remaining_cpu, copy_cost);
-      if (cost < best_cost) { best_cost = cost; n = copied; }
+    Id n = missing.size();
+    if (cpu_compute) {
+      __int128 remaining_cpu = 0;
+      for (Id e : missing) remaining_cpu += cpu_cost(e);
+      const Id copy_unit = denominator_ - numerator_;
+      __int128 best_cost = std::max(remaining_cpu, static_cast<__int128>(npu_fixed_cost_));
+      n = 0;
+      const Id limit = std::min<Id>({Id(missing.size()), Id(targets.size()), max_transfers_});
+      for (Id copied = 1; copied <= limit; ++copied) {
+        remaining_cpu -= cpu_cost(missing[copied - 1]);
+        __int128 copy_cost = static_cast<__int128>(copied) * copy_unit + npu_fixed_cost_;
+        __int128 cost = std::max(remaining_cpu, copy_cost);
+        if (cost < best_cost) { best_cost = cost; n = copied; }
+      }
     }
+    if (n > Id(targets.size())) throw std::runtime_error("Missing eviction targets for NPU demand");
     NativePlan out{mapping, {}, std::move(ids), std::move(weights)};
-    for (Id i = 0; i < std::min<Id>({n, Id(missing.size()), Id(targets.size())}); ++i) {
+    for (Id i = 0; i < n; ++i) {
       Id e = missing[i], slot = targets[i], victim = owners[slot];
       if (victim >= 0) out.mapping[victim] = -1;
       out.mapping[e] = slot; out.loads.emplace_back(slot, e);
@@ -122,11 +140,15 @@ class NativeHostPlanner {
     for (size_t r = 0; r < out.ids.size(); ++r)
       for (size_t c = 0; c < out.ids[r].size(); ++c) {
         Id e = out.ids[r][c];
-        if (e < 0 || out.mapping[e] >= 0) { out.ids[r][c] = -1; out.weights[r][c] = 0; }
+        if (!cpu_compute || e < 0 || out.mapping[e] >= 0) {
+          out.ids[r][c] = -1;
+          out.weights[r][c] = 0;
+        }
       }
     return out;
   }
 
+ public:
   // Predictions read the target layer's history; they are NOT observations.
   NativePlan plan_prefetch(const std::vector<std::vector<Id>>& ids,
                            const std::vector<std::vector<double>>& weights,
@@ -173,15 +195,21 @@ class NativeHostPlanner {
 
   std::vector<std::pair<Id, Id>> prepare(uintptr_t ids, uintptr_t weights, uintptr_t mapping,
                                        Id tokens, Id topk, int id_size, int map_size) {
-    return prepare_impl(ids, weights, mapping, tokens, topk, id_size, map_size, -1);
+    return prepare_impl(ids, weights, mapping, tokens, topk, id_size, map_size, -1, true);
+  }
+  std::vector<std::pair<Id, Id>> prepare_npu_demand(uintptr_t ids, uintptr_t weights, uintptr_t mapping,
+                                                  Id tokens, Id topk, int id_size, int map_size) {
+    return prepare_impl(ids, weights, mapping, tokens, topk, id_size, map_size, -1, false);
   }
   std::vector<std::pair<Id, Id>> prepare_prefetch(uintptr_t ids, uintptr_t weights, uintptr_t mapping,
                                        Id tokens, Id topk, int id_size, int map_size, Id cap) {
     if (cap < 1) throw std::invalid_argument("Prefetch cap must be positive");
-    return prepare_impl(ids, weights, mapping, tokens, topk, id_size, map_size, cap);
+    return prepare_impl(ids, weights, mapping, tokens, topk, id_size, map_size, cap, false);
   }
+
+ private:
   std::vector<std::pair<Id, Id>> prepare_impl(uintptr_t ids, uintptr_t weights, uintptr_t mapping,
-                                       Id tokens, Id topk, int id_size, int map_size, Id prefetch_cap) {
+                                       Id tokens, Id topk, int id_size, int map_size, Id prefetch_cap, bool cpu_compute) {
     if (!ids || !weights || !mapping || tokens < 1 || topk < 1 ||
         (id_size != 4 && id_size != 8) || (map_size != 4 && map_size != 8))
       throw std::invalid_argument("Invalid native pinned route buffers");
@@ -202,9 +230,9 @@ class NativeHostPlanner {
       scores[r][c] = read_scalar<float>(reinterpret_cast<void*>(weights + (r * topk + c) * sizeof(float)));
     }
     auto out = prefetch_cap >= 0 ? plan_prefetch(rows, scores, std::move(map), prefetch_cap)
-                                : plan(std::move(rows), std::move(scores), std::move(map));
+                                : plan_demand(std::move(rows), std::move(scores), std::move(map), cpu_compute);
     for (Id e = 0; e < experts_; ++e) write(mapping, e, map_size, out.mapping[e]);
-    if (prefetch_cap < 0) for (Id r = 0; r < tokens; ++r) for (Id c = 0; c < topk; ++c) {
+    if (cpu_compute) for (Id r = 0; r < tokens; ++r) for (Id c = 0; c < topk; ++c) {
       write(ids, r * topk + c, id_size, out.ids[r][c]);
       float w = out.weights[r][c];
       std::memcpy(reinterpret_cast<void*>(weights + (r * topk + c) * sizeof(float)), &w, sizeof(float));
@@ -228,7 +256,7 @@ class NativeCpuDispatcher {
   };
   struct Completion { Channel* channel; uint64_t task; };
   using WeightJob = std::pair<unsigned, std::vector<std::pair<Id, Id>>>;
-  const KtDispatchApi* api_;
+  const KtDispatchApi* api_ = nullptr;
   std::array<std::unique_ptr<Channel>, kMaxChannels> channels_;
   std::atomic<unsigned> count_{0};
   std::atomic<bool> alive_{true};
@@ -243,6 +271,7 @@ class NativeCpuDispatcher {
   unsigned dma_layer_count_ = 0;
   std::atomic<bool> native_dma_{false}, draining_{false};
   std::atomic<uint64_t> dma_jobs_{0}, dma_experts_{0}, dma_fields_{0};
+  std::atomic<uint64_t> demand_calls_{0}, demand_loads_{0};
   uintptr_t dma_stream_ = 0;
   int (*memcpy_async_)(void*, size_t, const void*, size_t, int, void*) = nullptr;
   int (*synchronize_stream_)(void*) = nullptr;
@@ -325,10 +354,18 @@ class NativeCpuDispatcher {
             }
             continue;
           }
+          if (!c.cpu) {
+            auto loads = c.planner->prepare_npu_demand(
+                c.ids, c.weights, c.mapping, c.tokens, c.topk, c.id_size, c.map_size);
+            demand_calls_.fetch_add(1, std::memory_order_relaxed);
+            queue_weight(i, std::move(loads), 0);
+            continue;
+          }
           // The historical callback_enter marker now means native input observed.
           // Begin before admission so the full CPU startup path is measurable.
           uint64_t task = api_->begin(c.layer);
           auto loads = c.planner->prepare(c.ids, c.weights, c.mapping, c.tokens, c.topk, c.id_size, c.map_size);
+          demand_calls_.fetch_add(1, std::memory_order_relaxed);
           if (task) api_->mark(demand_transfer_phase(loads.size()));
           api_->mark("admission_end");
           api_->submit(c.cpu, c.entry, c.args);
@@ -372,7 +409,7 @@ class NativeCpuDispatcher {
           item = std::move(weights_.front()); weights_.pop_front();
         }
         dma_trace_active_.fetch_add(1, std::memory_order_acq_rel);
-        const bool timed = dma_trace_enabled_.load(std::memory_order_acquire);
+        const bool timed = !item.job.second.empty() && dma_trace_enabled_.load(std::memory_order_acquire);
         DmaTrace timing{};
         if (timed) timing = {item.job.first, item.task, 0, 0, item.job.second.size(), item.enqueued_ns,
                             clock_ns(CLOCK_MONOTONIC), 0, 0, 0, 0,
@@ -400,7 +437,7 @@ class NativeCpuDispatcher {
           }
         }
         if (timed) timing[8] = clock_ns(CLOCK_MONOTONIC);
-        copy(c.mapping_device, c.mapping, c.mapping_bytes);
+        if (!item.job.second.empty()) copy(c.mapping_device, c.mapping, c.mapping_bytes);
         if (timed) timing[9] = clock_ns(CLOCK_MONOTONIC);
         // This queues the same value-based Torch NPU external-ready protocol
         // after weights, scale and mapping on the very same DMA stream.
@@ -408,7 +445,8 @@ class NativeCpuDispatcher {
                           reinterpret_cast<void*>(dma_stream_)))
           throw std::runtime_error("Native DMA weight-ready publication failed");
         dma_experts_.fetch_add(item.job.second.size(), std::memory_order_relaxed);
-        dma_jobs_.fetch_add(1, std::memory_order_release);
+        if (!c.prefetch) demand_loads_.fetch_add(item.job.second.size(), std::memory_order_relaxed);
+        if (!item.job.second.empty()) dma_jobs_.fetch_add(1, std::memory_order_release);
         if (timed) {
           timing[10] = clock_ns(CLOCK_MONOTONIC); timing[13] = clock_ns(CLOCK_THREAD_CPUTIME_ID);
           size_t index = dma_trace_size_.load(std::memory_order_relaxed);
@@ -445,23 +483,25 @@ class NativeCpuDispatcher {
     } catch (const std::exception& e) { fail(e); }
   }
  public:
-  NativeCpuDispatcher(py::capsule api, uintptr_t stream, uintptr_t weight_stream, int poll_cpu, int completion_cpu) : stream_(stream), weight_stream_(weight_stream) {
+  NativeCpuDispatcher(py::object api, uintptr_t stream, uintptr_t weight_stream, int poll_cpu, int completion_cpu) : stream_(stream), weight_stream_(weight_stream) {
 #if !defined(__x86_64__) && !defined(__aarch64__)
     throw std::runtime_error("Native NPU-to-CPU dispatch requires x86-64 or AArch64");
 #endif
-    api_ = static_cast<const KtDispatchApi*>(api.get_pointer());
-    if (!api_ || api_->version != 1 || !api_->submit || !api_->sync || !api_->begin || !api_->context || !api_->mark)
-      throw std::invalid_argument("kt-kernel native dispatch API mismatch");
+    if (!api.is_none()) {
+      api_ = static_cast<const KtDispatchApi*>(api.cast<py::capsule>().get_pointer());
+      if (!api_ || api_->version != 1 || !api_->submit || !api_->sync || !api_->begin || !api_->context || !api_->mark)
+        throw std::invalid_argument("kt-kernel native dispatch API mismatch");
+    }
     acl_lib_ = dlopen("libascendcl.so", RTLD_NOW | RTLD_LOCAL);
     if (!acl_lib_) throw std::runtime_error("Cannot load libascendcl.so");
     auto get = reinterpret_cast<int (*)(void**)>(dlsym(acl_lib_, "aclrtGetCurrentContext"));
     set_context_ = reinterpret_cast<int (*)(void*)>(dlsym(acl_lib_, "aclrtSetCurrentContext"));
     record_event_ = reinterpret_cast<int (*)(void*, uint64_t, uint32_t, void*)>(dlsym(acl_lib_, "aclrtValueWrite"));
-    if (!get || !set_context_ || !record_event_ || !stream || !weight_stream || get(&context_) || !context_)
+    if (!get || !set_context_ || !record_event_ || (api_ && !stream) || !weight_stream || get(&context_) || !context_)
       throw std::runtime_error("Native dispatcher requires an initialized ACL context and value-based external events");
-    demand_transfer_phase(0);  // Allocate stable trace labels before monitoring starts.
+    if (api_) demand_transfer_phase(0);  // Allocate stable trace labels before monitoring starts.
     poll_ = std::thread([this, poll_cpu] { poll(poll_cpu); });
-    completion_ = std::thread([this, completion_cpu] { complete(completion_cpu); });
+    if (api_) completion_ = std::thread([this, completion_cpu] { complete(completion_cpu); });
   }
   ~NativeCpuDispatcher() {
     try { close(); } catch (const std::exception& e) { fail(e); }
@@ -534,7 +574,10 @@ class NativeCpuDispatcher {
                uintptr_t ids, uintptr_t weights, uintptr_t mapping, uintptr_t ready, uintptr_t weight_ready,
                Id tokens, Id topk, Id layer, int id_size, int map_size,
                std::shared_ptr<NativeHostPlanner> planner) {
-    if (!flag || flag % alignof(uint32_t) || !cpu || !task.first || !task.second || !ids || !weights || !mapping || !ready || !weight_ready || !planner ||
+    const bool with_cpu = cpu && task.first && task.second && ready;
+    const bool dma_only = !cpu && !task.first && !task.second && !ready;
+    if (!flag || flag % alignof(uint32_t) || !ids || !weights || !mapping || !weight_ready || !planner ||
+        (with_cpu ? !api_ : !dma_only || !native_dma_.load()) ||
         tokens < 1 || topk < 1 || (id_size != 4 && id_size != 8) || (map_size != 4 && map_size != 8))
       throw std::invalid_argument("Invalid native task registration");
     std::lock_guard<std::mutex> l(registration_);
@@ -546,6 +589,14 @@ class NativeCpuDispatcher {
     c->mapping = mapping; c->ready = ready; c->weight_ready = weight_ready; c->tokens = tokens; c->topk = topk; c->layer = layer;
     c->id_size = id_size; c->map_size = map_size; c->planner = std::move(planner);
     channels_[i] = std::move(c); count_.store(i + 1, std::memory_order_release); return i;
+  }
+  unsigned add_npu_demand(uintptr_t flag, uintptr_t ids, uintptr_t weights, uintptr_t mapping,
+                          uintptr_t ready, Id tokens, Id topk, Id layer, int id_size, int map_size,
+                          std::shared_ptr<NativeHostPlanner> planner) {
+    if (tokens < 1 || topk < 1 || !planner || tokens > planner->slots() / topk)
+      throw std::invalid_argument("NPU demand shape can exceed resident expert slots");
+    return add(flag, 0, {0, 0}, ids, weights, mapping, 0, ready, tokens, topk,
+               layer, id_size, map_size, std::move(planner));
   }
   unsigned add_prefetch(uintptr_t flag, uintptr_t ids, uintptr_t weights, uintptr_t mapping,
                         uintptr_t ready, Id tokens, Id topk, Id layer, int id_size, int map_size,
@@ -573,6 +624,7 @@ class NativeCpuDispatcher {
     c->id_size = id_size; c->map_size = map_size; c->planner = std::move(planner);
     channels_[i] = std::move(c); count_.store(i + 1, std::memory_order_release); return i;
   }
+  std::pair<uint64_t, uint64_t> demand_stats() const { return {demand_calls_.load(), demand_loads_.load()}; }
   std::pair<uint64_t, uint64_t> prefetch_stats() const { return {prefetched_.load(), prefetch_loads_.load()}; }
   WeightJob next_weight() {
     if (native_dma_.load()) throw std::runtime_error("Python DMA consumer disabled in native DMA mode");

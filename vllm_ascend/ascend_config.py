@@ -1895,6 +1895,8 @@ class ExpertOffloadConfig:
         # Expert weight H2D backend. MemFabric selects LOCAL for single-card
         # and SHARED DRAM for multi-card expert offload.
         "h2d_backend": "torch",  # Options: "torch", "memfabric"
+        # Use the native CPU-MoE DMA scheduler for NPU-only decode paging.
+        "native_expert_dma": False,
         "memfabric_pool_size_gib": 0,
         "memfabric_log_level": 3,
         # which prefetch METHOD drives the NON-HASH targets.
@@ -2090,6 +2092,14 @@ class ExpertOffloadConfig:
             raise TypeError("enable_multi_card must be a boolean")
         if self.config["h2d_backend"] not in ("torch", "memfabric"):
             raise ValueError("h2d_backend must be either 'torch' or 'memfabric'")
+        if not isinstance(self.native_expert_dma, bool):
+            raise TypeError("native_expert_dma must be a boolean")
+        if self.native_expert_dma:
+            if not self.expert_offload or self.enable_multi_card or self.h2d_backend != "torch":
+                raise ValueError("native_expert_dma requires single-card torch expert offload")
+            if (self.expert_substitution_enabled or self.experts_pruning_enabled
+                    or self.expert_predictor != "fate"):
+                raise ValueError("native_expert_dma requires FATE and disables route substitution/pruning")
         pool_size_gib = self.config["memfabric_pool_size_gib"]
         if isinstance(pool_size_gib, bool) or not isinstance(pool_size_gib, int):
             raise TypeError("memfabric_pool_size_gib must be an integer")

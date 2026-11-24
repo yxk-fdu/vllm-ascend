@@ -12,8 +12,9 @@ sources=[np.full((4,64),13,dtype=np.uint8),np.full((4,64),29,dtype=np.uint8)]
 for field in sources:
  for e in range(4):field[e]+=e
 destinations=[np.zeros((1,64),dtype=np.uint8) for _ in sources]
-engine=NativeCpuDispatcher(fixture.api(),1,2,62,63)
-engine.configure_dma(31,3)
+poll_cpu, completion_cpu, dma_cpu = sorted(os.sched_getaffinity(0))[:3]
+engine=NativeCpuDispatcher(fixture.api(),1,2,poll_cpu,completion_cpu)
+engine.configure_dma(dma_cpu,3)
 layer=engine.add_dma_layer([[addr(x[e]) for e in range(4)] for x in sources],[[addr(x[0])] for x in destinations],[64,64],4,1)
 owners=[]
 def channel(e,prefetch=False,dependency=None):
@@ -67,3 +68,78 @@ try:
  assert engine.dma_stats()==(3,3,6)
  print('ZERO_TRANSFER_VALIDATION_CLOSE_DRAIN_IDEMPOTENT_OK',engine.stats(),engine.dma_stats(),flush=True)
 finally:engine.close()
+
+
+def check_npu_only():
+    poll_cpu, dma_cpu = sorted(os.sched_getaffinity(0))[:2]
+    dispatcher = NativeCpuDispatcher(None, 0, 2, poll_cpu, -1)
+    dispatcher.configure_dma(dma_cpu, 3)
+    try:
+        planner = NativeHostPlanner(4, 2, 0, 0, 1, 0, None, [0.0] * 4)
+        target = np.zeros((2, 64), dtype=np.uint8)
+        dma_layer = dispatcher.add_dma_layer(
+            [[addr(sources[0][eid]) for eid in range(4)]],
+            [[addr(target[slot]) for slot in range(2)]],
+            [64], 4, 2,
+        )
+        pf_target = np.zeros_like(target)
+        pf_dma_layer = dispatcher.add_dma_layer(
+            [[addr(sources[0][eid]) for eid in range(4)]],
+            [[addr(pf_target[slot]) for slot in range(2)]],
+            [64], 4, 2,
+        )
+        flag = np.zeros(1, dtype=np.uint32)
+        ids = np.array([[2, 3]], dtype=np.int32)
+        weights = np.ones((1, 2), dtype=np.float32)
+        mapping = np.full(4, -1, dtype=np.int32)
+        device_mapping = mapping.copy()
+        ready = np.zeros(1, dtype=np.uint64)
+        channel_args = (
+            addr(flag), addr(ids), addr(weights), addr(mapping), addr(ready),
+            1, 2, 0, 4, 4, planner,
+        )
+        demand = dispatcher.add_npu_demand(*channel_args)
+        dispatcher.bind_dma_channel(demand, dma_layer, addr(device_mapping), device_mapping.nbytes)
+
+        pf_flag = flag.copy()
+        pf_ids = np.array([[1]], dtype=np.int32)
+        pf_weights = np.ones((1, 1), dtype=np.float32)
+        pf_mapping = mapping.copy()
+        pf_device_mapping = pf_mapping.copy()
+        pf_ready = ready.copy()
+        prefetch = dispatcher.add_prefetch_after(
+            addr(pf_flag), addr(pf_ids), addr(pf_weights), addr(pf_mapping), addr(pf_ready),
+            1, 1, 0, 4, 4, 1, planner, demand,
+        )
+        dispatcher.bind_dma_channel(prefetch, pf_dma_layer, addr(pf_device_mapping), pf_device_mapping.nbytes)
+
+        # Publish prefetch first so the test exercises the demand dependency.
+        order_start = acl.fake_order_size()
+        pf_flag[0] = 1
+        flag[0] = 1
+        assert fixture.wait_value_holding_gil(addr(pf_ready), 1)
+        assert ready[0] == 1
+        assert ids.tolist() == [[2, 3]]
+        assert weights.tolist() == [[1.0, 1.0]]
+        assert device_mapping.tolist() == [-1, -1, 0, 1]
+        assert pf_device_mapping.tolist() == [-1, 0, -1, -1]
+        np.testing.assert_array_equal(target, sources[0][[2, 3]])
+        np.testing.assert_array_equal(pf_target[0], sources[0][1])
+        order = [acl.fake_order_at(i) for i in range(order_start, acl.fake_order_size())]
+        assert order.index(addr(ready)) < order.index(addr(pf_ready))
+
+        # Replay with resident routes: the DMA queue signals ready without
+        # writing the mapping or creating a CPU task.
+        ready[0] = 0
+        flag[0] = 2
+        assert fixture.wait_value_holding_gil(addr(ready), 1)
+        dispatcher.close()
+        assert dispatcher.demand_stats() == (2, 2)
+        assert dispatcher.prefetch_stats() == (1, 1)
+        assert dispatcher.dma_stats() == (2, 3, 3)
+        assert dispatcher.stats() == (0, 0)
+    finally:
+        dispatcher.close()
+
+
+check_npu_only()

@@ -17,16 +17,20 @@ _LOG = logging.getLogger(__name__)
 
 
 class NativePollWorker:
-    def __init__(self, device, poll_cpu=None, completion_cpu=None):
-        from kt_kernel import kt_kernel_ext
+    def __init__(self, device, poll_cpu=None, completion_cpu=None, *, cpu_compute=True):
         from _vllm_ascend_lrc import NativeCpuDispatcher
 
+        api = None
+        if cpu_compute:
+            from kt_kernel import kt_kernel_ext
+
+            api = kt_kernel_ext.native_dispatch_api()
         self.device = device
         self._arm_host = platform.machine() == "aarch64"
-        self.stream = torch_npu.npu.SyncLaunchStream(device=device)
+        self.stream = torch_npu.npu.SyncLaunchStream(device=device) if cpu_compute else None
         self.weight_stream = torch_npu.npu.SyncLaunchStream(device=device)
         self.engine = NativeCpuDispatcher(
-            kt_kernel_ext.native_dispatch_api(), int(self.stream.npu_stream), int(self.weight_stream.npu_stream),
+            api, int(self.stream.npu_stream) if self.stream is not None else 0, int(self.weight_stream.npu_stream),
             poll_cpu if poll_cpu is not None else int(os.environ.get("KT_MOE_POLL_CPU", "6")),
             completion_cpu if completion_cpu is not None else int(os.environ.get("KT_MOE_COMPLETION_CPU", "7")))
         self._dma_layers = {}
@@ -38,8 +42,7 @@ class NativePollWorker:
         self._closed = False
         self._close_lock = threading.Lock()
         atexit.register(self.close)
-        _LOG.info("CPU MoE native dispatch: input flag -> C++ planner -> CPUInfer; "
-                  "native completion and DMA never return to Python during replay")
+        _LOG.info("MoE native dispatch: C++ expert planning and DMA, CPU computation=%s", cpu_compute)
 
     def _register_dma_layer(self, transfer):
         manager = transfer.worker.manager
@@ -111,6 +114,19 @@ class NativePollWorker:
         context.native_channel = index
         return result
 
+    def register_npu_demand(self, site):
+        dma_layer = self._register_dma_layer(site.transfer)
+        native = self.engine.add_npu_demand(
+            site.host_flag.data_ptr(), site.ids.data_ptr(), site.weights.data_ptr(), site.mapping.data_ptr(),
+            int(site.ready.npu_event), site.ids.shape[0], site.ids.shape[1], site.transfer.layer_idx,
+            site.ids.element_size(), site.mapping.element_size(), site.transfer.native_planner)
+        if native != len(self.channels):
+            raise RuntimeError("Native NPU demand registration mismatch")
+        self.channels.append((None, None, site.ready, site.host_flag, site, None))
+        self.engine.bind_dma_channel(native, dma_layer, site.transfer.layer.log2phy.data_ptr(),
+                                     site.mapping.numel() * site.mapping.element_size())
+        return native
+
     def register_prefetch(self, site, cap):
         dma_layer = self._register_dma_layer(site.transfer)
         index = len(self.channels)
@@ -126,6 +142,7 @@ class NativePollWorker:
             raise RuntimeError("Native prefetch registration mismatch")
         self.engine.bind_dma_channel(index, dma_layer, site.transfer.layer.log2phy.data_ptr(),
                                      site.mapping.numel() * site.mapping.element_size())
+        return native
 
     def set_dma_capture(self, enabled, directory):
         if enabled:

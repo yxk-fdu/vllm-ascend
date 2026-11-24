@@ -4,6 +4,7 @@ import pytest
 from vllm.config import CUDAGraphMode
 
 from vllm_ascend.expert_offload.graph_capacity import (
+    needs_eager_expert_loading,
     validate_graph_token_capacity,
     validate_requested_decode_capacity,
 )
@@ -50,3 +51,13 @@ def test_early_decode_check_does_not_reject_eager_or_unresolved_mixed_sizes(eage
 def test_resolved_sizes_are_checked_without_reapplying_decode_filter():
     with pytest.raises(ValueError, match=r"resolved graph token sizes \[16, 32\].*max_num_tokens=8"):
         validate_graph_token_capacity(8, [32, 1, 16, 32], stage="resolved", query_len=8, max_num_seqs=2)
+
+
+def test_npu_only_decode_falls_back_on_resident_slot_overflow():
+    manager = SimpleNamespace(_host_hybrid_enabled=False, enable_multi_card=False, offload_threshold=14)
+    assert not needs_eager_expert_loading(None, 32)
+    assert not needs_eager_expert_loading(manager, 8)
+    assert not needs_eager_expert_loading(manager, 14)
+    assert needs_eager_expert_loading(manager, 32)
+    manager._host_hybrid_enabled = True
+    assert not needs_eager_expert_loading(manager, 32)

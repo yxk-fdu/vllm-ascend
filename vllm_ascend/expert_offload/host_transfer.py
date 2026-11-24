@@ -257,5 +257,5 @@ def attach_host_transfers(manager):
                 calibration_cache=calibration_cache,
             )
             if manager.offload_config.expert_prefetch_enabled:
-                from .native_prefetch import NativePrefetchState
-                executor.backend._host_transfer.native_prefetch = NativePrefetchState(executor.backend._host_transfer)
+                from .native_prefetch import NativeRouteState
+                executor.backend._host_transfer.native_prefetch = NativeRouteState(executor.backend._host_transfer)
