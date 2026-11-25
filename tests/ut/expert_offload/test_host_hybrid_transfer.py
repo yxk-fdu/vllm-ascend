@@ -223,12 +223,14 @@ def test_graph_capture_defers_planning_and_keeps_weight_output_waits_separate(mo
         assert operations.index(("reset", output)) < operations.index(("publish", output))
         assert operations.index(("reset", contexts[-1].ready)) < operations.index(("publish", output))
         operations.clear()
+        task.join_input_stream()  # Early prefetch joins the same captured branch.
+        task.wait_for_weights()
         task.wait_for_weights()
         assert operations == [("wait", task._input_published_event), ("wait", contexts[-1].ready)]
         assert ("wait", output) not in operations
         operations.clear()
         task.wait()
-        assert operations[-1] == ("wait", output)
+        assert operations == [("wait", output)]
         operations.clear()
     assert contexts[0] is not contexts[1]
     # Simulate repeated notifications: CPU planning runs for each replay,
@@ -264,6 +266,7 @@ def test_runtime_planner_masks_pinned_inputs_and_queues_mapping_without_dma_wait
     context.mapping = torch.tensor([0, 1, -1, -1], dtype=torch.int32)
     context.mapping_task = object()
     context.ready = object()
+    context.recorded = None
     context.prepare()
     assert ids.tolist() == [[-1, -1, 3]]
     assert weights.tolist() == [[0.0, 0.0, 0.25]]
@@ -271,3 +274,36 @@ def test_runtime_planner_masks_pinned_inputs_and_queues_mapping_without_dma_wait
     assert len(requests) == 1 and requests[0].loads == ((1, 2),)
     assert requests[0].ready is context.ready
     assert requests[0].mapping_host is context.mapping
+
+
+def test_eager_reuse_pairs_each_dma_record_with_one_wait(runtime, monkeypatch):
+    operations = []
+    ready = SimpleNamespace(record=lambda _: operations.append("record"))
+    monkeypatch.setattr(torch.npu, "Event", lambda: ready, raising=False)
+    monkeypatch.setattr(torch, "empty", Mock(return_value=SimpleNamespace(copy_=Mock())))
+    monkeypatch.setattr(runtime, "prepare_mapping_copy", Mock())
+    layer = SimpleNamespace(log2phy=SimpleNamespace(shape=(4,), dtype=torch.int32))
+    worker = runtime.HostWeightWorker.__new__(runtime.HostWeightWorker)
+    worker.stream = object()
+    worker._error = None
+    worker._closed = False
+    worker.manager = SimpleNamespace(
+        _load_expert_weights_into_slots=lambda *_: operations.append("weights"),
+        _get_h2d_transport=lambda: SimpleNamespace(copy_batch=lambda _: operations.append("mapping")),
+    )
+    transfer = SimpleNamespace(layer=layer, layer_idx=0, worker=worker)
+    context = runtime.HostTransferContext(transfer, None, eager=True)
+    stream = SimpleNamespace(wait_event=lambda _: operations.append("wait"))
+
+    for _ in range(2):
+        context.stage(stream)
+        assert not context.recorded.is_set()
+        request = runtime.WeightRequest(
+            transfer, context.mapping, layer.log2phy, (), context.ready,
+            mapping_task=context.mapping_task, recorded=context.recorded,
+        )
+        worker._process(request)
+        assert context.recorded.is_set()
+        context.wait_for_eager_weights(stream)
+
+    assert operations == ["weights", "mapping", "record", "wait"] * 2

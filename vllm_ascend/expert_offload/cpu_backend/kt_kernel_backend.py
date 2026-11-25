@@ -217,14 +217,14 @@ class _KtKernelExpertTask:
         self._error: BaseException | None = None
         self._finished = False
         self._created_ns = time.perf_counter_ns()
+        self._weight_wait_enqueued = False
 
     def wait_for_weights(self):
         context = getattr(self, "_host_context", None)
-        if context is None:
+        if context is None or self._weight_wait_enqueued:
             return
-        context.transfer.worker.raise_if_failed()
-        stream = _current_stream(self._hidden_states.device)
-        stream.wait_event(context.ready)
+        context.wait_for_eager_weights(_current_stream(self._hidden_states.device))
+        self._weight_wait_enqueued = True
 
     def wait(self) -> torch.Tensor:
         if not self._finished:
@@ -274,29 +274,32 @@ class _KtKernelGraphExpertTask:
         self._cpu_stream = cpu_stream
         self.submitted_event = submitted_event
         self._input_published_event = input_published_event
+        self._inputs_joined = False
+        self._weight_wait_enqueued = False
         self._npu_done = None
         self._result: torch.Tensor | None = result
         self._error: BaseException | None = None
         self._finished = False
 
+    def join_input_stream(self):
+        if not self._inputs_joined and self._input_published_event is not None:
+            # External readiness alone does not join a captured side stream.
+            self._stream.wait_event(self._input_published_event)
+            self._inputs_joined = True
+
     def wait_for_weights(self):
         context = getattr(self, "_host_context", None)
-        if context is None:
+        if context is None or self._weight_wait_enqueued:
             return
         context.transfer.worker.raise_if_failed()
-        stream = _current_stream(self._hidden_states.device)
-        # Join the captured input fork before the external weight wait.
-        stream.wait_event(self._input_published_event)
-        stream.wait_event(context.ready)
+        self.join_input_stream()
+        self._stream.wait_event(context.ready)
+        self._weight_wait_enqueued = True
 
     def wait(self) -> torch.Tensor:
         if not self._finished:
             try:
-                if self._input_published_event is not None:
-                    # Join the captured D2H/submission branch without waiting
-                    # on CPU work. External readiness alone does not join a
-                    # capture stream back to its origin (CANN 107025).
-                    self._stream.wait_event(self._input_published_event)
+                self.join_input_stream()
                 # A graph device dependency, not a host-side synchronize.
                 # CPU result writes must finish before mapped-host reads.
                 # 不是让当前 Python 线程同步等待计算。

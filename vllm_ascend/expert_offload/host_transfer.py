@@ -28,6 +28,7 @@ class WeightRequest:
     ready: object
     timing: object = None
     mapping_task: object = None
+    recorded: threading.Event | None = None
 
 
 class HostWeightWorker:
@@ -77,6 +78,8 @@ class HostWeightWorker:
             # Record on DMA itself after weights, quant attributes and mapping.
             # Never use the independent CPU-output completion stream here.
             request.ready.record(self.stream)
+            if request.recorded is not None:
+                request.recorded.set()
             stamp(timing, 'ready_record_return')
 
     @torch.inference_mode()
@@ -131,20 +134,35 @@ class HostWeightWorker:
 class HostTransferContext:
     """Capture-site owners, kept alive for all replays of their graph."""
 
-    def __init__(self, transfer, hidden):
+    def __init__(self, transfer, hidden, *, eager=False):
         self.transfer, self.hidden = transfer, hidden
         self.mapping = torch.empty(
             transfer.layer.log2phy.shape, dtype=transfer.layer.log2phy.dtype, device="cpu", pin_memory=True
         )
         self.mapping_task = prepare_mapping_copy(self.mapping, transfer.layer.log2phy)
-        self.ready = torch_npu.npu.ExternalEvent()
-        if not self.ready.npu_event:
-            raise RuntimeError("Host DMA requires value-based ExternalEvent support")
+        self.recorded = threading.Event() if eager else None
+        if eager:
+            self.ready = torch.npu.Event()
+        else:
+            self.ready = torch_npu.npu.ExternalEvent()
+            if not self.ready.npu_event:
+                raise RuntimeError("Host DMA requires value-based ExternalEvent support")
 
     def stage(self, stream):
-        # Captured reset precedes sequence publication on EVERY replay.
-        self.ready.reset(stream)
+        if self.recorded is None:
+            # Captured reset precedes sequence publication on every replay.
+            self.ready.reset(stream)
+        else:
+            self.recorded.clear()
         self.mapping.copy_(self.transfer.layer.log2phy, non_blocking=True)
+
+    def wait_for_eager_weights(self, stream):
+        # A normal event must be recorded before the consumer queues its wait.
+        # The worker signals after enqueueing the record, while DMA can still be in flight.
+        assert self.recorded is not None
+        self.recorded.wait()
+        self.transfer.worker.raise_if_failed()
+        stream.wait_event(self.ready)
 
     def prepare(self):
         transfer = self.transfer
@@ -154,17 +172,17 @@ class HostTransferContext:
             loads = transfer.native_planner.prepare(
                 ids.data_ptr(), weights.data_ptr(), self.mapping.data_ptr(),
                 ids.shape[0], ids.shape[1], ids.element_size(), self.mapping.element_size())
-            transfer.worker.submit(WeightRequest(transfer, self.mapping, transfer.layer.log2phy, loads, self.ready,
-                                                  mapping_task=self.mapping_task))
-            return
-        plan = transfer.policy.plan(ids.tolist(), weights.float().tolist(), self.mapping.tolist())
-        # Full routes are observed first; CPU then computes only unassigned
-        # misses. Original device routes remain untouched.
-        ids.copy_(torch.tensor(plan.cpu_ids, dtype=ids.dtype).reshape(ids.shape))
-        weights.copy_(torch.tensor(plan.cpu_weights, dtype=weights.dtype).reshape(weights.shape))
-        self.mapping.copy_(torch.tensor(plan.mapping, dtype=self.mapping.dtype))
-        transfer.worker.submit(WeightRequest(transfer, self.mapping, transfer.layer.log2phy, plan.loads, self.ready,
-                                              mapping_task=self.mapping_task))
+        else:
+            plan = transfer.policy.plan(ids.tolist(), weights.float().tolist(), self.mapping.tolist())
+            # Keep the original device routes. Mask only the pinned inputs used by CPU compute.
+            ids.copy_(torch.tensor(plan.cpu_ids, dtype=ids.dtype).reshape(ids.shape))
+            weights.copy_(torch.tensor(plan.cpu_weights, dtype=weights.dtype).reshape(weights.shape))
+            self.mapping.copy_(torch.tensor(plan.mapping, dtype=self.mapping.dtype))
+            loads = plan.loads
+        transfer.worker.submit(WeightRequest(
+            transfer, self.mapping, transfer.layer.log2phy, loads, self.ready,
+            mapping_task=self.mapping_task, recorded=self.recorded,
+        ))
 
 
 class HostExpertTransfer:
@@ -228,7 +246,7 @@ class HostExpertTransfer:
         key = (tuple(hidden.shape), hidden.dtype)
         context = self._eager_contexts.get(key)
         if context is None:
-            context = HostTransferContext(self, hidden)
+            context = HostTransferContext(self, hidden, eager=True)
             self._eager_contexts[key] = context
         context.hidden = hidden
         return context

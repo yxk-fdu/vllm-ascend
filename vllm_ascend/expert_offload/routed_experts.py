@@ -167,12 +167,12 @@ def apply_offloaded_experts(layer, hidden_states, topk_weights, topk_ids, router
                 if not mgr.offload_config.expert_prefetch_enabled:
                     return
                 context = getattr(cpu_task, "_host_context", None)
-                published = getattr(cpu_task, "_input_published_event", None)
-                if context is None or published is None or not hasattr(context, "native_channel"):
+                join_input_stream = getattr(cpu_task, "join_input_stream", None)
+                if context is None or join_input_stream is None or not hasattr(context, "native_channel"):
                     return
                 # Join input publication, not demand weight completion. Prediction
                 # and D2H can now overlap current-layer H2D on the DMA stream.
-                torch.npu.current_stream().wait_event(published)
+                join_input_stream()
                 from vllm_ascend.expert_offload.native_prefetch import prefetch_after_demand
 
                 prefetch_after_demand(mgr, layer, hidden_states, context)
