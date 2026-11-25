@@ -210,7 +210,7 @@ def get_native_npu_transfer(manager, layer):
     if transfer is None:
         from vllm_ascend.quantization.quant_type import QuantType
 
-        if getattr(layer.quant_method, "quant_type", None) != QuantType.W4A8MXFP:
+        if layer.quant_type != QuantType.W4A8MXFP:
             raise ValueError("native_expert_dma currently supports W4A8MXFP MoE layers")
         transfer = NativeNpuTransfer(manager, layer, layer_idx, start_native_npu_dma(manager))
         manager._native_npu_transfers[layer_idx] = transfer
